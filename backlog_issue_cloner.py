@@ -387,12 +387,13 @@ def find_existing_by_summary(
     client: BacklogClient, project_id: int, summary: str
 ) -> dict | None:
     """
-    summary と完全一致する課題を返す。なければ None。
-    keyword 検索は summary + description を対象とするため完全一致フィルタが必須。
+    件名に summary を含む課題を返す。なければ None。
+    keyword 検索は summary + description を対象とするため、
+    件名への部分一致フィルタを行う。
     """
     candidates = client.search_issues_by_keyword(project_id, summary)
     for issue in candidates:
-        if issue.get("summary", "") == summary:
+        if summary in issue.get("summary", ""):
             return issue
     return None
 
