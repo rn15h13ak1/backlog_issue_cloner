@@ -460,9 +460,11 @@ def run(args: argparse.Namespace, config: dict) -> None:
     source_desc = source_issue.get("description") or ""
 
     # 4. 対象プロジェクトキーを確定
+    # Backlog API の単一課題レスポンスには projectId（数値）のみ含まれ project オブジェクトはない。
+    # issueKey（例: PROJ-123）のプレフィックスをプロジェクトキーとして使用する。
     target_project_key = (
         clone_cfg.get("target_project_key")
-        or source_issue["project"]["projectKey"]
+        or source_issue["issueKey"].rsplit("-", 1)[0]
     )
 
     # 5. プロジェクト情報取得（ID解決）
