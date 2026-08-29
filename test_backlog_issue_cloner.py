@@ -4,7 +4,12 @@ Backlog 課題クローンツール ユニットテスト
 BacklogClient をモック化して、API 接続なしで動作を検証する。
 """
 
+import email.message
+import io
+import json
 import unittest
+import urllib.error
+from contextlib import contextmanager
 from io import StringIO
 from unittest.mock import MagicMock, patch
 
@@ -13,12 +18,50 @@ import backlog_issue_cloner as sut
 
 
 # ===========================================================================
-# BacklogClient ユニットテスト
+# テスト用ヘルパ
+# ===========================================================================
+
+
+@contextmanager
+def tty():
+    """確認プロンプトが対話環境として扱われるようにする。"""
+    with patch("sys.stdin.isatty", return_value=True):
+        yield
+
+
+class FakeResponse:
+    """urlopen の戻り値（コンテキストマネージャ）を模したオブジェクト。"""
+
+    def __init__(self, payload):
+        self._body = json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def http_error(code, *, body=None, retry_after=None):
+    headers = email.message.Message()
+    if retry_after is not None:
+        headers["Retry-After"] = str(retry_after)
+    fp = io.BytesIO(json.dumps(body).encode("utf-8")) if body is not None else None
+    return urllib.error.HTTPError(
+        "https://test.backlog.com/api/v2/issues", code, "err", headers, fp
+    )
+
+
+# ===========================================================================
+# find_existing_by_summary テスト
 # ===========================================================================
 
 
 class TestFindExistingBySummary(unittest.TestCase):
-    """find_existing_by_summary — 件名部分一致フィルタの動作を検証。"""
+    """find_existing_by_summary — 件名フィルタの動作を検証。"""
 
     def _make_client(self, issues):
         client = MagicMock()
@@ -59,9 +102,47 @@ class TestFindExistingBySummary(unittest.TestCase):
         result = sut.find_existing_by_summary(client, 10, "【定期】20260828 タスク")
         self.assertEqual(result["issueKey"], "PROJ-1")
 
+    # --- match_mode="exact" ---
+
+    def test_exact_mode_rejects_substring(self):
+        """exact モードでは部分一致を既存扱いしない。"""
+        issues = [{"issueKey": "PROJ-2", "summary": "【定期】20260828 タスク（再発）"}]
+        client = self._make_client(issues)
+        result = sut.find_existing_by_summary(
+            client, 10, "【定期】20260828 タスク", match_mode="exact"
+        )
+        self.assertIsNone(result)
+
+    def test_exact_mode_accepts_identical_summary(self):
+        issues = [
+            {"issueKey": "PROJ-2", "summary": "【定期】20260828 タスク（再発）"},
+            {"issueKey": "PROJ-3", "summary": "【定期】20260828 タスク"},
+        ]
+        client = self._make_client(issues)
+        result = sut.find_existing_by_summary(
+            client, 10, "【定期】20260828 タスク", match_mode="exact"
+        )
+        self.assertEqual(result["issueKey"], "PROJ-3")
+
+    # --- status_ids ---
+
+    def test_status_ids_passed_through(self):
+        client = self._make_client([])
+        sut.find_existing_by_summary(
+            client, 10, "件名", status_ids=sut.STATUS_IDS_OPEN
+        )
+        client.search_issues_by_keyword.assert_called_once_with(
+            10, "件名", sut.STATUS_IDS_OPEN
+        )
+
+
+# ===========================================================================
+# search_issues_by_keyword テスト
+# ===========================================================================
+
 
 class TestSearchIssuesPagination(unittest.TestCase):
-    """search_issues_by_keyword — 遅延列挙による短絡を検証。"""
+    """search_issues_by_keyword — 遅延列挙による短絡と絞り込みを検証。"""
 
     TARGET = "【定期】20260828 タスク"
 
@@ -116,6 +197,142 @@ class TestSearchIssuesPagination(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(mock_get.call_count, 1)
 
+    def test_status_ids_included_in_request(self):
+        """status_ids を渡すとクエリパラメータに載る。"""
+        client = self._client()
+        with patch.object(client, "_get", side_effect=[[]]) as mock_get:
+            list(client.search_issues_by_keyword(10, "件名", [1, 2, 3]))
+        self.assertEqual(mock_get.call_args[0][1]["statusId"], [1, 2, 3])
+
+    def test_status_ids_omitted_when_none(self):
+        client = self._client()
+        with patch.object(client, "_get", side_effect=[[]]) as mock_get:
+            list(client.search_issues_by_keyword(10, "件名"))
+        self.assertNotIn("statusId", mock_get.call_args[0][1])
+
+
+# ===========================================================================
+# リトライ動作テスト
+# ===========================================================================
+
+
+class TestRetry(unittest.TestCase):
+    """_request — 429 / 5xx / ネットワークエラーの再試行を検証。"""
+
+    def _client(self, **kw):
+        kw.setdefault("max_retries", 3)
+        kw.setdefault("retry_backoff", 1.0)
+        return sut.BacklogClient(
+            space_host="test.backlog.com", api_key="TESTKEY", **kw
+        )
+
+    @contextmanager
+    def _urlopen(self, side_effect):
+        with patch("backlog_issue_cloner.urllib.request.urlopen",
+                   side_effect=side_effect) as mock_open, \
+             patch("backlog_issue_cloner.time.sleep") as mock_sleep, \
+             patch("sys.stderr", new_callable=StringIO):
+            yield mock_open, mock_sleep
+
+    def test_retries_on_429_then_succeeds(self):
+        client = self._client()
+        with self._urlopen([http_error(429), FakeResponse({"id": 1})]) as (op, sleep):
+            result = client.get_priorities()
+        self.assertEqual(result, {"id": 1})
+        self.assertEqual(op.call_count, 2)
+        sleep.assert_called_once_with(1.0)
+
+    def test_retries_on_503_then_succeeds(self):
+        client = self._client()
+        with self._urlopen([http_error(503), FakeResponse({"id": 2})]) as (op, _):
+            result = client.get_priorities()
+        self.assertEqual(result, {"id": 2})
+        self.assertEqual(op.call_count, 2)
+
+    def test_exponential_backoff(self):
+        """待機秒数が 1 → 2 → 4 と倍増する。"""
+        client = self._client()
+        errors = [http_error(500)] * 4  # 初回 + リトライ3回すべて失敗
+        with self._urlopen(errors) as (op, sleep):
+            with self.assertRaises(sut.BacklogError):
+                client.get_priorities()
+        self.assertEqual(op.call_count, 4)
+        self.assertEqual([c[0][0] for c in sleep.call_args_list], [1.0, 2.0, 4.0])
+
+    def test_retry_after_header_takes_precedence(self):
+        client = self._client()
+        with self._urlopen([http_error(429, retry_after=7),
+                            FakeResponse({})]) as (_, sleep):
+            client.get_priorities()
+        sleep.assert_called_once_with(7.0)
+
+    def test_retry_after_capped_at_max_delay(self):
+        client = self._client(retry_max_delay=30.0)
+        with self._urlopen([http_error(429, retry_after=999),
+                            FakeResponse({})]) as (_, sleep):
+            client.get_priorities()
+        sleep.assert_called_once_with(30.0)
+
+    def test_invalid_retry_after_falls_back_to_backoff(self):
+        """HTTP-date 形式の Retry-After は解釈できないので指数バックオフを使う。"""
+        client = self._client()
+        with self._urlopen([http_error(429, retry_after="Wed, 21 Oct 2026 07:28:00 GMT"),
+                            FakeResponse({})]) as (_, sleep):
+            client.get_priorities()
+        sleep.assert_called_once_with(1.0)
+
+    def test_no_retry_on_401(self):
+        """認証エラーは再試行せず即座に BacklogError。"""
+        client = self._client()
+        err = http_error(401, body={"errors": [{"message": "認証失敗", "code": 11}]})
+        with self._urlopen([err]) as (op, sleep):
+            with self.assertRaises(sut.BacklogError) as ctx:
+                client.get_priorities()
+        self.assertEqual(op.call_count, 1)
+        sleep.assert_not_called()
+        self.assertEqual(ctx.exception.status, 401)
+        self.assertIn("api_key を確認してください。", ctx.exception.hint)
+
+    def test_retries_on_network_error(self):
+        client = self._client()
+        errors = [urllib.error.URLError("接続拒否"), FakeResponse({"ok": True})]
+        with self._urlopen(errors) as (op, _):
+            result = client.get_priorities()
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(op.call_count, 2)
+
+    def test_network_error_exhausted_raises_backlog_error(self):
+        client = self._client()
+        errors = [urllib.error.URLError("接続拒否")] * 4
+        with self._urlopen(errors) as (op, _):
+            with self.assertRaises(sut.BacklogError) as ctx:
+                client.get_priorities()
+        self.assertEqual(op.call_count, 4)
+        self.assertIn("ネットワークエラー", str(ctx.exception))
+
+    def test_retries_disabled(self):
+        client = self._client(max_retries=0)
+        with self._urlopen([http_error(503)]) as (op, sleep):
+            with self.assertRaises(sut.BacklogError):
+                client.get_priorities()
+        self.assertEqual(op.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_404_with_allow_404_returns_none_without_retry(self):
+        client = self._client()
+        with self._urlopen([http_error(404)]) as (op, sleep):
+            result = client.get_issue("PROJ-999")
+        self.assertIsNone(result)
+        self.assertEqual(op.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_no_change_error_raised_on_code_7(self):
+        client = self._client()
+        err = http_error(400, body={"errors": [{"message": "変更なし", "code": 7}]})
+        with self._urlopen([err]):
+            with self.assertRaises(sut.BacklogNoChangeError):
+                client.update_issue("PROJ-1", {"description": "本文"})
+
 
 # ===========================================================================
 # resolve_date テスト
@@ -133,8 +350,8 @@ class TestResolveDate(unittest.TestCase):
             result = sut.resolve_date(None)
         self.assertEqual(result, "20260828")
 
-    def test_invalid_date_exits(self):
-        with self.assertRaises(SystemExit):
+    def test_invalid_date_raises_config_error(self):
+        with self.assertRaises(sut.ConfigError):
             sut.resolve_date("not-a-date")
 
 
@@ -174,10 +391,10 @@ class TestResolveIssueTypeId(unittest.TestCase):
         self.assertEqual(id_, 1)
         self.assertEqual(name, "タスク")
 
-    def test_empty_types_exits(self):
+    def test_empty_types_raises_config_error(self):
         client = MagicMock()
         client.get_issue_types.return_value = []
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(sut.ConfigError):
             sut.resolve_issue_type_id(client, "PROJ", None)
 
 
@@ -217,10 +434,69 @@ class TestResolvePriorityId(unittest.TestCase):
         self.assertEqual(id_, 2)
         self.assertEqual(name, "高")
 
-    def test_empty_priorities_exits(self):
+    def test_empty_priorities_raises_config_error(self):
         client = self._make_client([])
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(sut.ConfigError):
             sut.resolve_priority_id(client, None)
+
+
+# ===========================================================================
+# 確認プロンプトテスト
+# ===========================================================================
+
+
+class TestConfirm(unittest.TestCase):
+    def test_assume_yes_skips_input(self):
+        with patch("sys.stdout", new_callable=StringIO), \
+             patch("builtins.input", side_effect=AssertionError("input が呼ばれた")):
+            self.assertTrue(sut.confirm_create("件名", "PROJ-1", "本文", assume_yes=True))
+
+    def test_non_interactive_without_yes_returns_false(self):
+        """非対話環境で --yes なしなら input を呼ばずに False。"""
+        with patch("sys.stdout", new_callable=StringIO), \
+             patch("sys.stderr", new_callable=StringIO) as err, \
+             patch("sys.stdin.isatty", return_value=False), \
+             patch("builtins.input", side_effect=AssertionError("input が呼ばれた")):
+            result = sut.confirm_create("件名", "PROJ-1", "本文")
+        self.assertFalse(result)
+        self.assertIn("--yes", err.getvalue())
+
+    def test_interactive_yes(self):
+        with patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            self.assertTrue(sut.confirm_update("PROJ-1", "旧", "新"))
+
+    def test_interactive_no(self):
+        with patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="n"):
+            self.assertFalse(sut.confirm_update("PROJ-1", "旧", "新"))
+
+    def test_eof_treated_as_no(self):
+        with patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", side_effect=EOFError):
+            self.assertFalse(sut.confirm_update("PROJ-1", "旧", "新"))
+
+
+# ===========================================================================
+# 終了コードテスト
+# ===========================================================================
+
+
+class TestExitCode(unittest.TestCase):
+    def test_default_returns_zero_for_all_success(self):
+        for outcome in (sut.OUTCOME_NO_CHANGE, sut.OUTCOME_CREATED, sut.OUTCOME_UPDATED):
+            self.assertEqual(sut.exit_code_for(outcome, detailed=False), 0)
+
+    def test_skipped_is_non_zero_even_by_default(self):
+        self.assertEqual(sut.exit_code_for(sut.OUTCOME_SKIPPED, detailed=False), 20)
+
+    def test_detailed_distinguishes_outcomes(self):
+        self.assertEqual(sut.exit_code_for(sut.OUTCOME_NO_CHANGE, detailed=True), 0)
+        self.assertEqual(sut.exit_code_for(sut.OUTCOME_CREATED, detailed=True), 10)
+        self.assertEqual(sut.exit_code_for(sut.OUTCOME_UPDATED, detailed=True), 11)
+
+    def test_detailed_skipped_still_twenty(self):
+        self.assertEqual(sut.exit_code_for(sut.OUTCOME_SKIPPED, detailed=True), 20)
 
 
 # ===========================================================================
@@ -228,12 +504,13 @@ class TestResolvePriorityId(unittest.TestCase):
 # ===========================================================================
 
 
-def _make_args(execute=False, date=None, debug=False, config="config.yaml"):
+def _make_args(execute=False, date=None, debug=False, config="config.yaml", yes=False):
     args = MagicMock()
     args.execute = execute
     args.date = date
     args.debug = debug
     args.config = config
+    args.yes = yes
     return args
 
 
@@ -245,6 +522,8 @@ def _make_config(
     target_project_key=None,
     issue_type=None,
     priority=None,
+    match_mode=None,
+    include_closed=None,
 ):
     cfg = {
         "backlog": {
@@ -264,6 +543,10 @@ def _make_config(
         cfg["clone"]["issue_type"] = issue_type
     if priority:
         cfg["clone"]["priority"] = priority
+    if match_mode:
+        cfg["clone"]["match_mode"] = match_mode
+    if include_closed is not None:
+        cfg["clone"]["include_closed"] = include_closed
     return cfg
 
 
@@ -279,164 +562,214 @@ ISSUE_TYPES = [{"id": 1, "name": "タスク"}]
 PRIORITIES = [{"id": 2, "name": "高"}, {"id": 3, "name": "中"}]
 
 
+def _mock_client(existing_issue=None):
+    mock_client = MagicMock()
+    mock_client.get_issue.return_value = SOURCE_ISSUE
+    mock_client.get_project.return_value = PROJECT
+    mock_client.get_issue_types.return_value = ISSUE_TYPES
+    mock_client.get_priorities.return_value = PRIORITIES
+    mock_client.create_issue.return_value = {
+        "issueKey": "PROJ-100", "summary": "【定期】20260828 タスク"
+    }
+    mock_client.update_issue.return_value = {
+        "issueKey": "PROJ-99", "summary": "【定期】20260828 タスク"
+    }
+    mock_client.search_issues_by_keyword.return_value = (
+        [existing_issue] if existing_issue else []
+    )
+    return patch("backlog_issue_cloner.BacklogClient", return_value=mock_client), mock_client
+
+
+EXISTING_SAME = {
+    "issueKey": "PROJ-99",
+    "summary": "【定期】20260828 タスク",
+    "description": "本文テキスト",
+}
+EXISTING_DIFF = {
+    "issueKey": "PROJ-99",
+    "summary": "【定期】20260828 タスク",
+    "description": "古い本文",
+}
+
+
 class TestRunDryRun(unittest.TestCase):
     """ドライランモードでは API 書き込みが発生しないことを検証。"""
 
-    def _patch_client(self, existing_issue=None, existing_desc=None):
-        """BacklogClient をモックに差し替えるコンテキストマネージャを返す。"""
-        mock_client = MagicMock()
-        mock_client.get_issue.return_value = SOURCE_ISSUE
-        mock_client.get_project.return_value = PROJECT
-        mock_client.get_issue_types.return_value = ISSUE_TYPES
-        mock_client.get_priorities.return_value = PRIORITIES
-
-        if existing_issue:
-            mock_client.search_issues_by_keyword.return_value = [existing_issue]
-        else:
-            mock_client.search_issues_by_keyword.return_value = []
-
-        return patch("backlog_issue_cloner.BacklogClient", return_value=mock_client), mock_client
-
     def test_dry_run_no_existing_no_create(self):
-        """ドライラン: 既存課題なし → create_issue は呼ばれない。"""
-        patcher, mock_client = self._patch_client()
+        """ドライラン: 既存課題なし → create_issue は呼ばれず created を返す。"""
+        patcher, mock_client = _mock_client()
         with patcher, patch("sys.stdout", new_callable=StringIO):
-            sut.run(_make_args(execute=False, date="20260828"), _make_config())
+            outcome = sut.run(_make_args(execute=False, date="20260828"), _make_config())
         mock_client.create_issue.assert_not_called()
+        self.assertEqual(outcome, sut.OUTCOME_CREATED)
 
     def test_dry_run_existing_same_desc_no_update(self):
         """ドライラン: 既存課題あり・本文同一 → update_issue は呼ばれない。"""
-        existing = {
-            "issueKey": "PROJ-99",
-            "summary": "【定期】20260828 タスク",
-            "description": "本文テキスト",
-        }
-        patcher, mock_client = self._patch_client(existing_issue=existing)
+        patcher, mock_client = _mock_client(existing_issue=EXISTING_SAME)
         with patcher, patch("sys.stdout", new_callable=StringIO):
-            sut.run(_make_args(execute=False, date="20260828"), _make_config())
+            outcome = sut.run(_make_args(execute=False, date="20260828"), _make_config())
         mock_client.update_issue.assert_not_called()
+        self.assertEqual(outcome, sut.OUTCOME_NO_CHANGE)
 
     def test_dry_run_existing_diff_desc_no_update(self):
         """ドライラン: 既存課題あり・本文差分あり → update_issue は呼ばれない。"""
-        existing = {
-            "issueKey": "PROJ-99",
-            "summary": "【定期】20260828 タスク",
-            "description": "古い本文",
-        }
-        patcher, mock_client = self._patch_client(existing_issue=existing)
+        patcher, mock_client = _mock_client(existing_issue=EXISTING_DIFF)
         with patcher, patch("sys.stdout", new_callable=StringIO):
-            sut.run(_make_args(execute=False, date="20260828"), _make_config())
+            outcome = sut.run(_make_args(execute=False, date="20260828"), _make_config())
         mock_client.update_issue.assert_not_called()
+        self.assertEqual(outcome, sut.OUTCOME_UPDATED)
 
 
 class TestRunExecute(unittest.TestCase):
     """--execute モードでの作成・更新・スキップを検証。"""
 
-    def _patch_client(self, existing_issue=None):
-        mock_client = MagicMock()
-        mock_client.get_issue.return_value = SOURCE_ISSUE
-        mock_client.get_project.return_value = PROJECT
-        mock_client.get_issue_types.return_value = ISSUE_TYPES
-        mock_client.get_priorities.return_value = PRIORITIES
-        mock_client.create_issue.return_value = {
-            "issueKey": "PROJ-100", "summary": "【定期】20260828 タスク"
-        }
-        mock_client.update_issue.return_value = {
-            "issueKey": "PROJ-99", "summary": "【定期】20260828 タスク"
-        }
-
-        if existing_issue:
-            mock_client.search_issues_by_keyword.return_value = [existing_issue]
-        else:
-            mock_client.search_issues_by_keyword.return_value = []
-
-        return patch("backlog_issue_cloner.BacklogClient", return_value=mock_client), mock_client
-
     def test_execute_creates_when_no_existing(self):
         """execute: 既存課題なし → ユーザーが y → create_issue が呼ばれる。"""
-        patcher, mock_client = self._patch_client()
-        with patcher, \
-             patch("sys.stdout", new_callable=StringIO), \
+        patcher, mock_client = _mock_client()
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
              patch("builtins.input", return_value="y"):
-            sut.run(_make_args(execute=True, date="20260828"), _make_config())
+            outcome = sut.run(_make_args(execute=True, date="20260828"), _make_config())
         mock_client.create_issue.assert_called_once()
         call_params = mock_client.create_issue.call_args[0][0]
         self.assertEqual(call_params["summary"], "【定期】20260828 タスク")
         self.assertEqual(call_params["description"], "本文テキスト")
+        self.assertEqual(outcome, sut.OUTCOME_CREATED)
 
     def test_execute_skips_when_user_cancels_create(self):
         """execute: 既存課題なし → ユーザーが n → create_issue は呼ばれない。"""
-        patcher, mock_client = self._patch_client()
-        with patcher, \
-             patch("sys.stdout", new_callable=StringIO), \
+        patcher, mock_client = _mock_client()
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
              patch("builtins.input", return_value="n"):
-            sut.run(_make_args(execute=True, date="20260828"), _make_config())
+            outcome = sut.run(_make_args(execute=True, date="20260828"), _make_config())
         mock_client.create_issue.assert_not_called()
+        self.assertEqual(outcome, sut.OUTCOME_SKIPPED)
 
     def test_execute_updates_when_desc_differs(self):
         """execute: 既存あり・本文差分あり → ユーザーが y → update_issue が呼ばれる。"""
-        existing = {
-            "issueKey": "PROJ-99",
-            "summary": "【定期】20260828 タスク",
-            "description": "古い本文",
-        }
-        patcher, mock_client = self._patch_client(existing_issue=existing)
-        with patcher, \
-             patch("sys.stdout", new_callable=StringIO), \
+        patcher, mock_client = _mock_client(existing_issue=EXISTING_DIFF)
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
              patch("builtins.input", return_value="y"):
-            sut.run(_make_args(execute=True, date="20260828"), _make_config())
-        mock_client.update_issue.assert_called_once_with("PROJ-99", {"description": "本文テキスト"})
+            outcome = sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        mock_client.update_issue.assert_called_once_with(
+            "PROJ-99", {"description": "本文テキスト"}
+        )
+        self.assertEqual(outcome, sut.OUTCOME_UPDATED)
 
     def test_execute_skips_when_desc_same(self):
         """execute: 既存あり・本文同一 → 何もしない。"""
-        existing = {
-            "issueKey": "PROJ-99",
-            "summary": "【定期】20260828 タスク",
-            "description": "本文テキスト",  # SOURCE_ISSUE と同じ
-        }
-        patcher, mock_client = self._patch_client(existing_issue=existing)
+        patcher, mock_client = _mock_client(existing_issue=EXISTING_SAME)
         with patcher, patch("sys.stdout", new_callable=StringIO):
-            sut.run(_make_args(execute=True, date="20260828"), _make_config())
+            outcome = sut.run(_make_args(execute=True, date="20260828"), _make_config())
         mock_client.create_issue.assert_not_called()
         mock_client.update_issue.assert_not_called()
+        self.assertEqual(outcome, sut.OUTCOME_NO_CHANGE)
+
+    def test_no_change_error_is_treated_as_no_change(self):
+        """更新時に BacklogNoChangeError が出たら no_change 扱い。"""
+        patcher, mock_client = _mock_client(existing_issue=EXISTING_DIFF)
+        mock_client.update_issue.side_effect = sut.BacklogNoChangeError("変更なし")
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            outcome = sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        self.assertEqual(outcome, sut.OUTCOME_NO_CHANGE)
+
+    # --- --yes ---
+
+    def test_yes_creates_without_prompt(self):
+        """--yes: 非対話環境でも input なしで作成する。"""
+        patcher, mock_client = _mock_client()
+        with patcher, patch("sys.stdout", new_callable=StringIO), \
+             patch("sys.stdin.isatty", return_value=False), \
+             patch("builtins.input", side_effect=AssertionError("input が呼ばれた")):
+            outcome = sut.run(
+                _make_args(execute=True, date="20260828", yes=True), _make_config()
+            )
+        mock_client.create_issue.assert_called_once()
+        self.assertEqual(outcome, sut.OUTCOME_CREATED)
+
+    def test_without_yes_non_interactive_skips(self):
+        """--yes なしの非対話実行は作成せず skipped を返す。"""
+        patcher, mock_client = _mock_client()
+        with patcher, patch("sys.stdout", new_callable=StringIO), \
+             patch("sys.stderr", new_callable=StringIO), \
+             patch("sys.stdin.isatty", return_value=False):
+            outcome = sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        mock_client.create_issue.assert_not_called()
+        self.assertEqual(outcome, sut.OUTCOME_SKIPPED)
+
+    # --- プロジェクト解決 ---
 
     def test_project_id_reused_from_source_issue(self):
-        """target_project_key 未設定時は source_issue の projectId を流用し get_project を呼ばない。"""
-        patcher, mock_client = self._patch_client()
-        with patcher, \
-             patch("sys.stdout", new_callable=StringIO), \
+        """target_project_key 未設定時は source_issue の projectId を流用する。"""
+        patcher, mock_client = _mock_client()
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
              patch("builtins.input", return_value="n"):
             sut.run(_make_args(execute=True, date="20260828"), _make_config())
         mock_client.get_project.assert_not_called()
-        # 重複チェックは source_issue の projectId で行われる
         mock_client.search_issues_by_keyword.assert_called_once_with(
-            10, "【定期】20260828 タスク"
+            10, "【定期】20260828 タスク", sut.STATUS_IDS_OPEN
         )
 
     def test_project_key_derived_when_project_id_missing(self):
-        """projectId が無い場合は issueKey プレフィックスで get_project にフォールバックする。"""
-        patcher, mock_client = self._patch_client()
-        source_without_project_id = {
+        """projectId が無い場合は issueKey プレフィックスで get_project にフォールバック。"""
+        patcher, mock_client = _mock_client()
+        mock_client.get_issue.return_value = {
             k: v for k, v in SOURCE_ISSUE.items() if k != "projectId"
         }
-        mock_client.get_issue.return_value = source_without_project_id
-        with patcher, \
-             patch("sys.stdout", new_callable=StringIO), \
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
              patch("builtins.input", return_value="n"):
             sut.run(_make_args(execute=True, date="20260828"), _make_config())
         mock_client.get_project.assert_called_once_with("PROJ")
 
     def test_target_project_key_override(self):
         """target_project_key が設定されている場合はそちらを優先する。"""
-        patcher, mock_client = self._patch_client()
-        with patcher, \
-             patch("sys.stdout", new_callable=StringIO), \
+        patcher, mock_client = _mock_client()
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
              patch("builtins.input", return_value="n"):
             sut.run(
                 _make_args(execute=True, date="20260828"),
                 _make_config(target_project_key="OTHER"),
             )
         mock_client.get_project.assert_called_once_with("OTHER")
+
+    # --- 重複判定オプション ---
+
+    def test_include_closed_disables_status_filter(self):
+        patcher, mock_client = _mock_client()
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="n"):
+            sut.run(
+                _make_args(execute=True, date="20260828"),
+                _make_config(include_closed=True),
+            )
+        mock_client.search_issues_by_keyword.assert_called_once_with(
+            10, "【定期】20260828 タスク", None
+        )
+
+    def test_exact_match_mode_creates_when_only_substring_exists(self):
+        """exact モードでは部分一致の既存課題があっても新規作成する。"""
+        near_miss = {
+            "issueKey": "PROJ-99",
+            "summary": "【定期】20260828 タスク（再発）",
+            "description": "別の本文",
+        }
+        patcher, mock_client = _mock_client(existing_issue=near_miss)
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            outcome = sut.run(
+                _make_args(execute=True, date="20260828"),
+                _make_config(match_mode="exact"),
+            )
+        mock_client.create_issue.assert_called_once()
+        mock_client.update_issue.assert_not_called()
+        self.assertEqual(outcome, sut.OUTCOME_CREATED)
+
+    def test_source_issue_missing_raises_config_error(self):
+        patcher, mock_client = _mock_client()
+        mock_client.get_issue.return_value = None
+        with patcher, patch("sys.stdout", new_callable=StringIO):
+            with self.assertRaises(sut.ConfigError):
+                sut.run(_make_args(execute=True, date="20260828"), _make_config())
 
 
 # ===========================================================================
@@ -460,34 +793,46 @@ class TestValidateConfig(unittest.TestCase):
     def test_valid_config_passes(self):
         sut.validate_config(self._base_config())  # 例外が出なければ OK
 
-    def test_placeholder_api_key_exits(self):
+    def test_placeholder_api_key_raises(self):
         cfg = self._base_config()
         cfg["backlog"]["api_key"] = "YOUR_API_KEY_HERE"
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(sut.ConfigError):
             sut.validate_config(cfg)
 
-    def test_empty_api_key_exits(self):
+    def test_empty_api_key_raises(self):
         cfg = self._base_config()
         cfg["backlog"]["api_key"] = ""
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(sut.ConfigError):
             sut.validate_config(cfg)
 
-    def test_placeholder_space_host_exits(self):
+    def test_placeholder_space_host_raises(self):
         cfg = self._base_config()
         cfg["backlog"]["space_host"] = "yourcompany.backlog.com"
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(sut.ConfigError):
             sut.validate_config(cfg)
 
-    def test_placeholder_source_issue_key_exits(self):
+    def test_placeholder_source_issue_key_raises(self):
         cfg = self._base_config()
         cfg["clone"]["source_issue_key"] = "PROJ-123"
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(sut.ConfigError):
             sut.validate_config(cfg)
 
-    def test_empty_summary_template_exits(self):
+    def test_empty_summary_template_raises(self):
         cfg = self._base_config()
         cfg["clone"]["summary_template"] = ""
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config(cfg)
+
+    def test_invalid_match_mode_raises(self):
+        cfg = self._base_config()
+        cfg["clone"]["match_mode"] = "regex"
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config(cfg)
+
+    def test_valid_match_modes_pass(self):
+        for mode in sut.MATCH_MODES:
+            cfg = self._base_config()
+            cfg["clone"]["match_mode"] = mode
             sut.validate_config(cfg)
 
 
