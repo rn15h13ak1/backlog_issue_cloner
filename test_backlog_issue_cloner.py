@@ -7,6 +7,8 @@ BacklogClient をモック化して、API 接続なしで動作を検証する�
 import email.message
 import io
 import json
+import pathlib
+import tempfile
 import unittest
 import urllib.error
 import urllib.parse
@@ -566,6 +568,25 @@ class TestResolvePriorityId(unittest.TestCase):
         self.assertEqual(id_, 3)
         self.assertEqual(name, "中")
 
+    def test_warns_and_falls_back_to_chuu_when_not_found(self):
+        """指定した優先度が見つからない場合は警告して「中」を使う。"""
+        client = self._make_client()
+        with patch("sys.stderr", new_callable=StringIO) as err:
+            id_, name = sut.resolve_priority_id(client, "存在しない優先度")
+        self.assertEqual(id_, 3)
+        self.assertEqual(name, "中")
+        message = err.getvalue()
+        self.assertIn("存在しない優先度", message)
+        self.assertIn("高", message)  # 利用可能な値を案内する
+
+    def test_falls_back_to_first_when_not_found_and_no_chuu(self):
+        priorities = [{"id": 2, "name": "高"}, {"id": 4, "name": "低"}]
+        client = self._make_client(priorities)
+        with patch("sys.stderr", new_callable=StringIO):
+            id_, name = sut.resolve_priority_id(client, "存在しない優先度")
+        self.assertEqual(id_, 2)
+        self.assertEqual(name, "高")
+
     def test_fallback_to_first_when_chuu_not_found(self):
         priorities = [{"id": 2, "name": "高"}, {"id": 4, "name": "低"}]
         client = self._make_client(priorities)
@@ -792,6 +813,35 @@ class TestRunExecute(unittest.TestCase):
         mock_client.update_issue.assert_called_once_with(
             "PROJ-99", {"description": "本文テキスト"}
         )
+        self.assertEqual(outcome, sut.OUTCOME_UPDATED)
+
+    def test_execute_skips_when_user_cancels_update(self):
+        """execute: 既存あり・本文差分あり → ユーザーが n → update_issue は呼ばれない。"""
+        patcher, mock_client = _mock_client(existing_issue=EXISTING_DIFF)
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="n"):
+            outcome = sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        mock_client.update_issue.assert_not_called()
+        self.assertEqual(outcome, sut.OUTCOME_SKIPPED)
+
+    def test_execute_skips_update_when_non_interactive_without_yes(self):
+        patcher, mock_client = _mock_client(existing_issue=EXISTING_DIFF)
+        with patcher, patch("sys.stdout", new_callable=StringIO), \
+             patch("sys.stderr", new_callable=StringIO), \
+             patch("sys.stdin.isatty", return_value=False):
+            outcome = sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        mock_client.update_issue.assert_not_called()
+        self.assertEqual(outcome, sut.OUTCOME_SKIPPED)
+
+    def test_yes_updates_without_prompt(self):
+        patcher, mock_client = _mock_client(existing_issue=EXISTING_DIFF)
+        with patcher, patch("sys.stdout", new_callable=StringIO), \
+             patch("sys.stdin.isatty", return_value=False), \
+             patch("builtins.input", side_effect=AssertionError("input が呼ばれた")):
+            outcome = sut.run(
+                _make_args(execute=True, date="20260828", yes=True), _make_config()
+            )
+        mock_client.update_issue.assert_called_once()
         self.assertEqual(outcome, sut.OUTCOME_UPDATED)
 
     def test_execute_skips_when_desc_same(self):
@@ -1145,6 +1195,200 @@ class TestClientSettingsFromConfig(unittest.TestCase):
         self.assertEqual(kwargs["max_retries"], 0)
         self.assertEqual(kwargs["retry_backoff"], 0.25)
         self.assertEqual(kwargs["retry_max_delay"], 10.0)
+
+
+# ===========================================================================
+# load_config テスト
+# ===========================================================================
+
+
+class TestLoadConfig(unittest.TestCase):
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.dir = pathlib.Path(self._dir.name)
+
+    def _write(self, name, text):
+        path = self.dir / name
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    def test_missing_file_raises_config_error(self):
+        with self.assertRaises(sut.ConfigError) as ctx:
+            sut.load_config(str(self.dir / "存在しない.yaml"))
+        self.assertIn("設定ファイルが見つかりません", str(ctx.exception))
+
+    def test_reads_yaml_mapping(self):
+        path = self._write(
+            "c.yaml",
+            'backlog:\n  space_host: "t.backlog.com"\n  api_key: "K"\n'
+            'clone:\n  source_issue_key: "P-1"\n  summary_template: "件名"\n',
+        )
+        cfg = sut.load_config(path)
+        self.assertEqual(cfg["backlog"]["space_host"], "t.backlog.com")
+        self.assertEqual(cfg["clone"]["summary_template"], "件名")
+
+    def test_empty_file_returns_none_and_validate_rejects_it(self):
+        """空ファイルは None になる。validate_config が弾くことまで確認する。"""
+        cfg = sut.load_config(self._write("empty.yaml", ""))
+        self.assertIsNone(cfg)
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config(cfg)
+
+
+# ===========================================================================
+# build_parser テスト
+# ===========================================================================
+
+
+class TestBuildParser(unittest.TestCase):
+    def parse(self, argv):
+        return sut.build_parser().parse_args(argv)
+
+    def test_defaults(self):
+        args = self.parse([])
+        self.assertFalse(args.execute)
+        self.assertFalse(args.yes)
+        self.assertFalse(args.detailed_exit_code)
+        self.assertFalse(args.debug)
+        self.assertIsNone(args.date)
+        self.assertTrue(args.config.endswith("config.yaml"))
+
+    def test_all_flags(self):
+        args = self.parse(["--execute", "--yes", "--detailed-exit-code", "--debug"])
+        self.assertTrue(args.execute)
+        self.assertTrue(args.yes)
+        self.assertTrue(args.detailed_exit_code)
+        self.assertTrue(args.debug)
+
+    def test_short_yes(self):
+        self.assertTrue(self.parse(["-y"]).yes)
+
+    def test_config_and_date(self):
+        args = self.parse(["--config", "my.yaml", "--date", "20260401"])
+        self.assertEqual(args.config, "my.yaml")
+        self.assertEqual(args.date, "20260401")
+
+    def test_unknown_option_exits(self):
+        with patch("sys.stderr", new_callable=StringIO):
+            with self.assertRaises(SystemExit):
+                self.parse(["--存在しない"])
+
+
+# ===========================================================================
+# main() テスト（終了コードへの変換）
+# ===========================================================================
+
+
+class TestMain(unittest.TestCase):
+    """main() が実行結果・例外を終了コードに変換することを検証。"""
+
+    def _main(self, argv=(), *, outcome=sut.OUTCOME_NO_CHANGE, error=None,
+              load_error=None):
+        out, err = StringIO(), StringIO()
+        load = (
+            patch("backlog_issue_cloner.load_config", side_effect=load_error)
+            if load_error
+            else patch("backlog_issue_cloner.load_config", return_value=_make_config())
+        )
+        with patch("sys.argv", ["backlog_issue_cloner.py", *argv]), load, \
+             patch("backlog_issue_cloner.validate_config"), \
+             patch("backlog_issue_cloner.run",
+                   side_effect=error or (lambda *a, **kw: outcome)), \
+             patch("sys.stdout", out), patch("sys.stderr", err):
+            with self.assertRaises(SystemExit) as ctx:
+                sut.main()
+        return ctx.exception.code, out.getvalue(), err.getvalue()
+
+    # --- 正常終了 ---
+
+    def test_success_returns_zero_without_detailed_flag(self):
+        for outcome in (sut.OUTCOME_NO_CHANGE, sut.OUTCOME_CREATED, sut.OUTCOME_UPDATED):
+            code, _, _ = self._main(["--execute", "--yes"], outcome=outcome)
+            self.assertEqual(code, 0, f"outcome={outcome}")
+
+    def test_detailed_exit_code_distinguishes_outcomes(self):
+        expected = {
+            sut.OUTCOME_NO_CHANGE: 0,
+            sut.OUTCOME_CREATED: 10,
+            sut.OUTCOME_UPDATED: 11,
+        }
+        for outcome, want in expected.items():
+            code, _, _ = self._main(
+                ["--execute", "--yes", "--detailed-exit-code"], outcome=outcome
+            )
+            self.assertEqual(code, want, f"outcome={outcome}")
+
+    def test_skipped_returns_twenty(self):
+        code, _, _ = self._main(["--execute"], outcome=sut.OUTCOME_SKIPPED)
+        self.assertEqual(code, 20)
+
+    def test_skipped_returns_twenty_with_detailed_flag(self):
+        code, _, _ = self._main(
+            ["--execute", "--detailed-exit-code"], outcome=sut.OUTCOME_SKIPPED
+        )
+        self.assertEqual(code, 20)
+
+    # --- エラー ---
+
+    def test_config_error_from_load_returns_two(self):
+        code, _, err = self._main(load_error=sut.ConfigError("設定ファイルが見つかりません"))
+        self.assertEqual(code, 2)
+        self.assertIn("設定ファイルが見つかりません", err)
+
+    def test_config_error_from_run_returns_two(self):
+        code, _, err = self._main(
+            ["--execute"], error=sut.ConfigError("コピー元課題が見つかりません。")
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("コピー元課題が見つかりません。", err)
+
+    def test_backlog_error_returns_three_with_hint(self):
+        code, _, err = self._main(
+            ["--execute"],
+            error=sut.BacklogError("認証に失敗", status=401, hint="api_key を確認してください。"),
+        )
+        self.assertEqual(code, 3)
+        self.assertIn("認証に失敗", err)
+        self.assertIn("api_key を確認してください。", err)
+
+    def test_backlog_error_without_hint(self):
+        code, _, err = self._main(["--execute"], error=sut.BacklogError("不明なエラー"))
+        self.assertEqual(code, 3)
+        self.assertIn("不明なエラー", err)
+
+    def test_no_change_error_is_a_backlog_error(self):
+        """BacklogNoChangeError も BacklogError として捕捉される。"""
+        code, _, _ = self._main(["--execute"], error=sut.BacklogNoChangeError("変更なし"))
+        self.assertEqual(code, 3)
+
+    # --- バナー表示 ---
+
+    def test_banner_shows_dry_run_by_default(self):
+        _, out, _ = self._main([])
+        self.assertIn("DRY RUN", out)
+        self.assertIn("test.backlog.com", out)
+
+    def test_banner_shows_execute_with_flag(self):
+        _, out, _ = self._main(["--execute", "--yes"])
+        self.assertIn("EXECUTE", out)
+        self.assertNotIn("DRY RUN", out)
+
+    # --- 引数の受け渡し ---
+
+    def test_args_are_passed_to_run(self):
+        with patch("sys.argv", ["prog", "--execute", "-y", "--date", "20260401"]), \
+             patch("backlog_issue_cloner.load_config", return_value=_make_config()), \
+             patch("backlog_issue_cloner.validate_config"), \
+             patch("backlog_issue_cloner.run",
+                   return_value=sut.OUTCOME_NO_CHANGE) as mock_run, \
+             patch("sys.stdout", new_callable=StringIO):
+            with self.assertRaises(SystemExit):
+                sut.main()
+        args = mock_run.call_args[0][0]
+        self.assertTrue(args.execute)
+        self.assertTrue(args.yes)
+        self.assertEqual(args.date, "20260401")
 
 
 if __name__ == "__main__":
