@@ -254,11 +254,14 @@ class BacklogClient:
                     time.sleep(delay)
                     continue
                 self._handle_http_error(e, endpoint, raise_no_change=raise_no_change)
-            except urllib.error.URLError as e:
+            except (urllib.error.URLError, TimeoutError) as e:
+                # 接続時のエラーは URLError に包まれるが、レスポンス待ちや読み込み中の
+                # タイムアウトは TimeoutError のまま送出されるため両方を捕捉する。
+                reason = getattr(e, "reason", None) or e
                 if attempt < self.max_retries:
                     delay = self._retry_delay(None, attempt)
                     print(
-                        f"  警告: 接続エラー（{endpoint}）: {e.reason}。"
+                        f"  警告: 接続エラー（{endpoint}）: {reason}。"
                         f"{delay:.1f} 秒後に再試行します"
                         f"（{attempt + 1}/{self.max_retries}）",
                         file=sys.stderr,
@@ -266,7 +269,7 @@ class BacklogClient:
                     time.sleep(delay)
                     continue
                 raise BacklogError(
-                    f"ネットワークエラー（{endpoint}）: {e.reason}",
+                    f"ネットワークエラー（{endpoint}）: {reason}",
                     hint="space_host とネットワーク接続を確認してください。",
                 ) from e
 

@@ -166,8 +166,13 @@ Backlog のキーワード検索は件名と本文の両方を対象とするた
 - HTTP 500 / 502 / 503 / 504
 - 接続エラー・タイムアウト
 
-429 のレスポンスに `Retry-After` ヘッダがあればその秒数を優先し、`retry_max_delay` を上限とします。
+リトライ対象のレスポンスに `Retry-After` ヘッダ（秒数形式）があればその値を優先し、`retry_max_delay` を上限とします。HTTP-date 形式の `Retry-After` は解釈できないため、その場合は通常のバックオフにフォールバックします。
+
 認証エラー（401）やパラメータ不正（400）は再試行せず、即座に終了コード `3` で終了します。
+
+なお、リトライは GET・POST・PATCH を区別せず行います。課題の作成中に 5xx やタイムアウトが起きた場合、
+サーバ側では作成が完了していたのに再試行して**同じ課題が 2 件できる可能性が理論上あります**。
+気になる場合は `max_retries: 0` でリトライを無効化してください。
 
 ## 制限事項
 
@@ -188,7 +193,9 @@ python3 -m unittest test_backlog_issue_cloner -v
 
 | ファイル | 役割 |
 |---|---|
+| `README.md` | このドキュメント |
 | `backlog_issue_cloner.py` | 本体（API クライアント + CLI） |
 | `config.sample.yaml` | 設定ファイルのテンプレート |
 | `test_backlog_issue_cloner.py` | ユニットテスト |
+| `.gitignore` | `config.yaml` などを除外 |
 | `config.yaml` | 実際の設定。API キーを含むため Git 管理外 |

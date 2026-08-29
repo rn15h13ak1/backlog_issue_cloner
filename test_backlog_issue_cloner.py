@@ -301,6 +301,24 @@ class TestRetry(unittest.TestCase):
         self.assertEqual(result, {"ok": True})
         self.assertEqual(op.call_count, 2)
 
+    def test_retries_on_timeout(self):
+        """レスポンス待ちのタイムアウトは TimeoutError で送出されるため個別に検証する。"""
+        client = self._client()
+        errors = [TimeoutError("timed out"), FakeResponse({"ok": True})]
+        with self._urlopen(errors) as (op, _):
+            result = client.get_priorities()
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(op.call_count, 2)
+
+    def test_timeout_exhausted_raises_backlog_error(self):
+        client = self._client()
+        with self._urlopen([TimeoutError("timed out")] * 4) as (op, _):
+            with self.assertRaises(sut.BacklogError) as ctx:
+                client.get_priorities()
+        self.assertEqual(op.call_count, 4)
+        self.assertIn("ネットワークエラー", str(ctx.exception))
+        self.assertIn("timed out", str(ctx.exception))
+
     def test_network_error_exhausted_raises_backlog_error(self):
         client = self._client()
         errors = [urllib.error.URLError("接続拒否")] * 4
