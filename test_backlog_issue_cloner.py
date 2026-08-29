@@ -835,6 +835,129 @@ class TestValidateConfig(unittest.TestCase):
             cfg["clone"]["match_mode"] = mode
             sut.validate_config(cfg)
 
+    # --- 空・型不正の設定ファイル ---
+
+    def test_none_config_raises(self):
+        """空の YAML は safe_load が None を返す。"""
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config(None)
+
+    def test_missing_backlog_section_raises(self):
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config({"clone": {}})
+
+    def test_null_backlog_section_raises(self):
+        """`backlog:` と書いて中身が空のケース。"""
+        cfg = self._base_config()
+        cfg["backlog"] = None
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config(cfg)
+
+    def test_null_clone_section_raises(self):
+        cfg = self._base_config()
+        cfg["clone"] = None
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config(cfg)
+
+    def test_non_mapping_section_raises(self):
+        cfg = self._base_config()
+        cfg["backlog"] = ["これはリスト"]
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config(cfg)
+
+    # --- 数値設定 ---
+
+    def test_numeric_settings_accept_valid_values(self):
+        cfg = self._base_config()
+        cfg["backlog"].update(
+            timeout=10, max_retries=0, retry_backoff=0.5, retry_max_delay=30
+        )
+        sut.validate_config(cfg)
+
+    def test_negative_numeric_setting_raises(self):
+        cfg = self._base_config()
+        cfg["backlog"]["max_retries"] = -1
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config(cfg)
+
+    def test_zero_timeout_raises(self):
+        cfg = self._base_config()
+        cfg["backlog"]["timeout"] = 0
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config(cfg)
+
+    def test_string_numeric_setting_raises(self):
+        cfg = self._base_config()
+        cfg["backlog"]["max_retries"] = "3"
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config(cfg)
+
+    def test_bool_numeric_setting_raises(self):
+        """bool は int のサブクラスだが数値設定としては受け付けない。"""
+        cfg = self._base_config()
+        cfg["backlog"]["max_retries"] = True
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config(cfg)
+
+    # --- 真偽値設定 ---
+
+    def test_bool_settings_accept_bool(self):
+        cfg = self._base_config()
+        cfg["backlog"]["ssl_verify"] = False
+        cfg["clone"]["include_closed"] = True
+        sut.validate_config(cfg)
+
+    def test_string_false_for_include_closed_raises(self):
+        """"false" という文字列は真と評価されてしまうため弾く。"""
+        cfg = self._base_config()
+        cfg["clone"]["include_closed"] = "false"
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config(cfg)
+
+    def test_string_for_ssl_verify_raises(self):
+        cfg = self._base_config()
+        cfg["backlog"]["ssl_verify"] = "true"
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config(cfg)
+
+
+# ===========================================================================
+# 設定ファイルの読み込み・BacklogClient への受け渡し
+# ===========================================================================
+
+
+class TestClientSettingsFromConfig(unittest.TestCase):
+    """timeout / retry 系の設定が BacklogClient に渡ることを検証。"""
+
+    def _run_and_capture_kwargs(self, backlog_overrides):
+        cfg = _make_config()
+        cfg["backlog"].update(backlog_overrides)
+        patcher, mock_client = _mock_client()
+        with patcher as mock_cls, patch("sys.stdout", new_callable=StringIO), \
+             patch("sys.stderr", new_callable=StringIO), \
+             patch("sys.stdin.isatty", return_value=False):
+            sut.run(_make_args(execute=True, date="20260828"), cfg)
+        return mock_cls.call_args[1]
+
+    def test_defaults_applied_when_absent(self):
+        kwargs = self._run_and_capture_kwargs({})
+        self.assertEqual(kwargs["timeout"], 30)
+        self.assertEqual(kwargs["max_retries"], 3)
+        self.assertEqual(kwargs["retry_backoff"], 1.0)
+        self.assertEqual(kwargs["retry_max_delay"], 60.0)
+
+    def test_config_values_override_defaults(self):
+        kwargs = self._run_and_capture_kwargs({
+            "timeout": 5,
+            "max_retries": 0,
+            "retry_backoff": 0.25,
+            "retry_max_delay": 10.0,
+        })
+        self.assertEqual(kwargs["timeout"], 5)
+        self.assertEqual(kwargs["max_retries"], 0)
+        self.assertEqual(kwargs["retry_backoff"], 0.25)
+        self.assertEqual(kwargs["retry_max_delay"], 10.0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

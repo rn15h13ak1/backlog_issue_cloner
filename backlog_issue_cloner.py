@@ -4,12 +4,14 @@ Backlog 課題クローンツール
 指定した課題の description をコピーして新規課題を作成する CLI ツール。
 
 使い方:
-  python backlog_issue_cloner.py                   # ドライラン（デフォルト）
-  python backlog_issue_cloner.py --execute         # 実際に作成/更新（対話確認あり）
-  python backlog_issue_cloner.py --execute --yes   # 確認なしで実行（cron 向け）
-  python backlog_issue_cloner.py --date 20260401   # 日付を指定
-  python backlog_issue_cloner.py --execute --debug # デバッグ出力付き
-  python backlog_issue_cloner.py --config my.yaml  # 設定ファイルを指定
+  python3 backlog_issue_cloner.py                    # ドライラン（デフォルト）
+  python3 backlog_issue_cloner.py --execute          # 実際に作成/更新（対話確認あり）
+  python3 backlog_issue_cloner.py --execute --yes    # 確認なしで実行（cron 向け）
+  python3 backlog_issue_cloner.py --date 20260401    # 日付を指定
+  python3 backlog_issue_cloner.py --execute --debug  # デバッグ出力付き
+  python3 backlog_issue_cloner.py --config my.yaml   # 設定ファイルを指定
+  python3 backlog_issue_cloner.py --detailed-exit-code
+                                                     # 結果を終了コードで区別する
 
 終了コード:
   0  正常終了
@@ -21,7 +23,9 @@ Backlog 課題クローンツール
   0  変更なし / 10 新規作成した / 11 本文を更新した
 
 依存:
-  pip install pyyaml
+  pip3 install pyyaml
+
+詳細は README.md を参照。
 """
 
 import argparse
@@ -81,6 +85,14 @@ STATUS_IDS_OPEN = [1, 2, 3]
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
 MATCH_MODES = ("substring", "exact")
+
+# backlog セクションで受け付ける数値設定と、その最小値
+NUMERIC_SETTINGS = (
+    ("timeout", 1),
+    ("max_retries", 0),
+    ("retry_backoff", 0),
+    ("retry_max_delay", 0),
+)
 
 
 def _close_quietly(resource) -> None:
@@ -403,8 +415,30 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _require_section(config: dict, name: str) -> dict:
+    """必須セクションを取り出す。空・型不正なら ConfigError。"""
+    section = config.get(name)
+    if section is None:
+        raise ConfigError(
+            f"config.yaml に {name}: セクションがありません。"
+            "config.sample.yaml を参考に記述してください。"
+        )
+    if not isinstance(section, dict):
+        raise ConfigError(
+            f"config.yaml の {name}: セクションの形式が不正です（マッピングが必要です）。"
+        )
+    return section
+
+
 def validate_config(config: dict) -> None:
-    b = config.get("backlog", {})
+    # yaml.safe_load は空ファイルに対して None を返すため最初に弾く
+    if not isinstance(config, dict):
+        raise ConfigError(
+            "設定ファイルの内容が空か、形式が不正です。"
+            "config.sample.yaml を参考に記述してください。"
+        )
+
+    b = _require_section(config, "backlog")
     for key, placeholder in [
         ("space_host", "yourcompany.backlog.com"),
         ("api_key", "YOUR_API_KEY_HERE"),
@@ -413,7 +447,7 @@ def validate_config(config: dict) -> None:
         if not val or val == placeholder:
             raise ConfigError(f"config.yaml の backlog.{key} を設定してください。")
 
-    c = config.get("clone", {})
+    c = _require_section(config, "clone")
     src = c.get("source_issue_key", "")
     if not src or src == "PROJ-123":
         raise ConfigError("config.yaml の clone.source_issue_key を設定してください。")
@@ -426,6 +460,28 @@ def validate_config(config: dict) -> None:
             f"config.yaml の clone.match_mode が不正です: {match_mode!r}"
             f"（利用可能: {', '.join(MATCH_MODES)}）"
         )
+
+    # 数値設定: bool は int のサブクラスなので明示的に除外する
+    for key, minimum in NUMERIC_SETTINGS:
+        if key not in b:
+            continue
+        val = b[key]
+        if isinstance(val, bool) or not isinstance(val, (int, float)) or val < minimum:
+            raise ConfigError(
+                f"config.yaml の backlog.{key} は {minimum} 以上の数値で"
+                f"指定してください: {val!r}"
+            )
+
+    # 真偽値設定: "false" のような文字列を真と誤解しないよう型を確認する
+    for section_name, section, key in (
+        ("backlog", b, "ssl_verify"),
+        ("clone", c, "include_closed"),
+    ):
+        if key in section and not isinstance(section[key], bool):
+            raise ConfigError(
+                f"config.yaml の {section_name}.{key} は true / false で"
+                f"指定してください: {section[key]!r}"
+            )
 
 
 # ===========================================================================
@@ -582,8 +638,10 @@ def run(args: argparse.Namespace, config: dict) -> str:
         ssl_verify=backlog_cfg.get("ssl_verify", True),
         base_path=backlog_cfg.get("base_path", ""),
         debug=args.debug,
+        timeout=backlog_cfg.get("timeout", 30),
         max_retries=backlog_cfg.get("max_retries", 3),
         retry_backoff=backlog_cfg.get("retry_backoff", 1.0),
+        retry_max_delay=backlog_cfg.get("retry_max_delay", 60.0),
     )
 
     # 3. コピー元課題を取得
@@ -718,12 +776,15 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 例:
-  python backlog_issue_cloner.py                          # ドライラン（デフォルト）
-  python backlog_issue_cloner.py --execute                # 実際に作成/更新
-  python backlog_issue_cloner.py --execute --yes          # 確認なしで実行（cron 向け）
-  python backlog_issue_cloner.py --date 20260401          # 日付を指定
-  python backlog_issue_cloner.py --execute --debug        # デバッグ出力付きで実行
-  python backlog_issue_cloner.py --config my_config.yaml  # 設定ファイルを指定
+  python3 backlog_issue_cloner.py                          # ドライラン（デフォルト）
+  python3 backlog_issue_cloner.py --execute                # 実際に作成/更新
+  python3 backlog_issue_cloner.py --execute --yes          # 確認なしで実行（cron 向け）
+  python3 backlog_issue_cloner.py --date 20260401          # 日付を指定
+  python3 backlog_issue_cloner.py --execute --debug        # デバッグ出力付きで実行
+  python3 backlog_issue_cloner.py --config my_config.yaml  # 設定ファイルを指定
+
+  # 作成/更新が起きたかを終了コードで判定する
+  python3 backlog_issue_cloner.py --execute --yes --detailed-exit-code
 
 終了コード:
   0  正常終了 / 2  設定エラー / 3  API・ネットワークエラー
