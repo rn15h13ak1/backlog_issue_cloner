@@ -344,6 +344,79 @@ class TestRetry(unittest.TestCase):
         self.assertEqual(op.call_count, 1)
         sleep.assert_not_called()
 
+    # --- 更新系リクエスト（POST / PATCH）のリトライ制限 ---
+
+    def _create(self, client):
+        return client.create_issue({"projectId": 1, "summary": "件名"})
+
+    def test_post_retries_on_429(self):
+        """429 は拒否＝未処理が確実なので更新系でも再試行する。"""
+        client = self._client()
+        with self._urlopen([http_error(429), FakeResponse({"issueKey": "P-1"})]) as (op, _):
+            result = self._create(client)
+        self.assertEqual(result, {"issueKey": "P-1"})
+        self.assertEqual(op.call_count, 2)
+
+    def test_post_does_not_retry_on_503(self):
+        """5xx は処理済みの可能性があるため更新系では再試行しない。"""
+        client = self._client()
+        with self._urlopen([http_error(503)] * 4) as (op, sleep):
+            with self.assertRaises(sut.BacklogError):
+                self._create(client)
+        self.assertEqual(op.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_post_does_not_retry_on_timeout(self):
+        """タイムアウトは送信後に失敗した可能性があるため再試行しない。"""
+        client = self._client()
+        with self._urlopen([TimeoutError("timed out")] * 4) as (op, sleep):
+            with self.assertRaises(sut.BacklogError) as ctx:
+                self._create(client)
+        self.assertEqual(op.call_count, 1)
+        sleep.assert_not_called()
+        self.assertIn("再試行していません", ctx.exception.hint)
+
+    def test_post_does_not_retry_on_connection_reset(self):
+        """接続断も送信後に失敗した可能性があるため再試行しない。"""
+        client = self._client()
+        with self._urlopen([ConnectionResetError("reset")] * 4) as (op, sleep):
+            with self.assertRaises(sut.BacklogError):
+                self._create(client)
+        self.assertEqual(op.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_post_retries_on_url_error(self):
+        """接続自体に失敗した場合はサーバに届いていないため再試行する。"""
+        client = self._client()
+        errors = [urllib.error.URLError("接続拒否"), FakeResponse({"issueKey": "P-1"})]
+        with self._urlopen(errors) as (op, _):
+            result = self._create(client)
+        self.assertEqual(result, {"issueKey": "P-1"})
+        self.assertEqual(op.call_count, 2)
+
+    def test_patch_does_not_retry_on_503(self):
+        client = self._client()
+        with self._urlopen([http_error(503)] * 4) as (op, _):
+            with self.assertRaises(sut.BacklogError):
+                client.update_issue("P-1", {"description": "本文"})
+        self.assertEqual(op.call_count, 1)
+
+    def test_get_still_retries_on_503(self):
+        """GET は冪等なので従来どおり再試行する。"""
+        client = self._client()
+        with self._urlopen([http_error(503), FakeResponse({"ok": True})]) as (op, _):
+            result = client.get_priorities()
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(op.call_count, 2)
+
+    def test_get_still_retries_on_connection_reset(self):
+        client = self._client()
+        errors = [ConnectionResetError("reset"), FakeResponse({"ok": True})]
+        with self._urlopen(errors) as (op, _):
+            result = client.get_priorities()
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(op.call_count, 2)
+
     def test_no_change_error_raised_on_code_7(self):
         client = self._client()
         err = http_error(400, body={"errors": [{"message": "変更なし", "code": 7}]})

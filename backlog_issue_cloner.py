@@ -218,6 +218,14 @@ class BacklogClient:
                     pass  # HTTP-date 形式は非対応。指数バックオフにフォールバック
         return min(self.retry_backoff * (2 ** attempt), self.retry_max_delay)
 
+    def _sleep_before_retry(self, message: str, delay: float, attempt: int) -> None:
+        print(
+            f"  警告: {message}。{delay:.1f} 秒後に再試行します"
+            f"（{attempt + 1}/{self.max_retries}）",
+            file=sys.stderr,
+        )
+        time.sleep(delay)
+
     def _request(
         self,
         req: urllib.request.Request,
@@ -225,11 +233,17 @@ class BacklogClient:
         *,
         allow_404: bool = False,
         raise_no_change: bool = False,
+        idempotent: bool = True,
     ):
         """
         リクエストを送信し、JSON をデコードして返す。
-        429 / 5xx / ネットワークエラーは max_retries 回まで指数バックオフで再試行する。
+        一時的な失敗は max_retries 回まで指数バックオフで再試行する。
         allow_404 が True なら 404 時に None を返す。
+
+        idempotent=False（課題の作成・更新）の場合、リクエストがサーバに届いて
+        いないことが確実な失敗のみ再試行する。届いた後に失敗した可能性がある
+        ケース（5xx・タイムアウト・接続断）で再送すると、サーバ側では成功して
+        いたときに課題が二重に作られるため。
         """
         for attempt in range(self.max_retries + 1):
             try:
@@ -242,35 +256,45 @@ class BacklogClient:
                 if allow_404 and e.code == 404:
                     _close_quietly(e)
                     return None
-                if e.code in RETRYABLE_STATUS and attempt < self.max_retries:
+                # 429 はリクエストが拒否された＝処理されていないことが確実なため、
+                # 更新系でも安全に再試行できる。
+                retryable = e.code in RETRYABLE_STATUS and (idempotent or e.code == 429)
+                if retryable and attempt < self.max_retries:
                     delay = self._retry_delay(e, attempt)
                     _close_quietly(e)
+                    self._sleep_before_retry(
+                        f"HTTP {e.code}（{endpoint}）", delay, attempt
+                    )
+                    continue
+                if e.code in RETRYABLE_STATUS and not idempotent:
                     print(
-                        f"  警告: HTTP {e.code}（{endpoint}）。"
-                        f"{delay:.1f} 秒後に再試行します"
-                        f"（{attempt + 1}/{self.max_retries}）",
+                        "  注意: 更新系リクエストのため再試行しません"
+                        "（課題が二重に作られるのを避けるため）",
                         file=sys.stderr,
                     )
-                    time.sleep(delay)
-                    continue
                 self._handle_http_error(e, endpoint, raise_no_change=raise_no_change)
-            except (urllib.error.URLError, TimeoutError) as e:
-                # 接続時のエラーは URLError に包まれるが、レスポンス待ちや読み込み中の
-                # タイムアウトは TimeoutError のまま送出されるため両方を捕捉する。
+            except OSError as e:
+                # URLError は接続・送信に失敗した場合で、リクエストはサーバに届いて
+                # いないため更新系でも再送してよい。それ以外（TimeoutError や
+                # ConnectionResetError など）は送信後に失敗した可能性があるため、
+                # 冪等なリクエストに限って再試行する。
+                unsent = isinstance(e, urllib.error.URLError)
                 reason = getattr(e, "reason", None) or e
-                if attempt < self.max_retries:
+                if (idempotent or unsent) and attempt < self.max_retries:
                     delay = self._retry_delay(None, attempt)
-                    print(
-                        f"  警告: 接続エラー（{endpoint}）: {reason}。"
-                        f"{delay:.1f} 秒後に再試行します"
-                        f"（{attempt + 1}/{self.max_retries}）",
-                        file=sys.stderr,
+                    self._sleep_before_retry(
+                        f"接続エラー（{endpoint}）: {reason}", delay, attempt
                     )
-                    time.sleep(delay)
                     continue
+                hint = "space_host とネットワーク接続を確認してください。"
+                if not idempotent and not unsent:
+                    hint += (
+                        "\n  更新系リクエストのため再試行していません。"
+                        "Backlog 側で処理済みの可能性があるため、"
+                        "課題の状態を確認してから再実行してください。"
+                    )
                 raise BacklogError(
-                    f"ネットワークエラー（{endpoint}）: {reason}",
-                    hint="space_host とネットワーク接続を確認してください。",
+                    f"ネットワークエラー（{endpoint}）: {reason}", hint=hint
                 ) from e
 
     def _get(
@@ -324,7 +348,9 @@ class BacklogClient:
             method=method,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-        return self._request(req, endpoint, raise_no_change=raise_no_change)
+        return self._request(
+            req, endpoint, raise_no_change=raise_no_change, idempotent=False
+        )
 
     def _post(self, endpoint: str, params: dict) -> dict:
         return self._send("POST", endpoint, params)
