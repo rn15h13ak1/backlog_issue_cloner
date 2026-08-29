@@ -70,7 +70,7 @@ class BacklogClient:
             if isinstance(value, list):
                 for v in value:
                     parts.append(
-                        f"{urllib.parse.quote(str(key))}%5B%5D={urllib.parse.quote(str(v))}"
+                        f"{urllib.parse.quote(f'{key}[]')}={urllib.parse.quote(str(v))}"
                     )
             else:
                 parts.append(
@@ -124,7 +124,10 @@ class BacklogClient:
             print(f"  → {hints[e.code]}", file=sys.stderr)
         sys.exit(1)
 
-    def _get(self, endpoint: str, params: dict = None) -> dict | list:
+    def _get(
+        self, endpoint: str, params: dict = None, *, allow_404: bool = False
+    ) -> dict | list | None:
+        """GET リクエストを送信する。allow_404 が True なら 404 時に None を返す。"""
         params = dict(params or {})
         params["apiKey"] = self.api_key
         query = self._build_query(params)
@@ -139,9 +142,19 @@ class BacklogClient:
             with urllib.request.urlopen(req, timeout=30, context=self.ssl_context) as res:
                 return json.loads(res.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
+            if allow_404 and e.code == 404:
+                return None
             self._handle_http_error(e, endpoint)
 
-    def _post(self, endpoint: str, params: dict) -> dict:
+    def _send(
+        self,
+        method: str,
+        endpoint: str,
+        params: dict,
+        *,
+        raise_no_change: bool = False,
+    ) -> dict:
+        """フォームエンコードのボディを持つリクエスト（POST / PATCH）を送信する。"""
         url = f"{self.base_url}{endpoint}?apiKey={urllib.parse.quote(self.api_key)}"
 
         body_parts = []
@@ -158,47 +171,14 @@ class BacklogClient:
         ).encode("utf-8")
 
         if self.debug:
-            print(f"  [DEBUG POST] {endpoint}", file=sys.stderr)
+            print(f"  [DEBUG {method}] {endpoint}", file=sys.stderr)
             for k, v in body_parts:
                 print(f"    {k}={v}", file=sys.stderr)
 
         req = urllib.request.Request(
             url,
             data=body,
-            method="POST",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30, context=self.ssl_context) as res:
-                return json.loads(res.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            self._handle_http_error(e, endpoint)
-
-    def _patch(self, endpoint: str, params: dict, *, raise_no_change: bool = False) -> dict:
-        url = f"{self.base_url}{endpoint}?apiKey={urllib.parse.quote(self.api_key)}"
-
-        body_parts = []
-        for key, value in params.items():
-            if isinstance(value, list):
-                for v in value:
-                    body_parts.append((f"{key}[]", str(v)))
-            else:
-                body_parts.append((key, str(value)))
-
-        body = "&".join(
-            f"{k}={urllib.parse.quote_plus(v)}"
-            for k, v in body_parts
-        ).encode("utf-8")
-
-        if self.debug:
-            print(f"  [DEBUG PATCH] {endpoint}", file=sys.stderr)
-            for k, v in body_parts:
-                print(f"    {k}={v}", file=sys.stderr)
-
-        req = urllib.request.Request(
-            url,
-            data=body,
-            method="PATCH",
+            method=method,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         try:
@@ -206,6 +186,12 @@ class BacklogClient:
                 return json.loads(res.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             self._handle_http_error(e, endpoint, raise_no_change=raise_no_change)
+
+    def _post(self, endpoint: str, params: dict) -> dict:
+        return self._send("POST", endpoint, params)
+
+    def _patch(self, endpoint: str, params: dict, *, raise_no_change: bool = False) -> dict:
+        return self._send("PATCH", endpoint, params, raise_no_change=raise_no_change)
 
     # ------------------------------------------------------------------
     # マスターデータ取得
@@ -226,26 +212,18 @@ class BacklogClient:
 
     def get_issue(self, issue_id_or_key: str) -> dict | None:
         """課題を1件取得。存在しない場合（404）は None を返す。"""
-        url = (
-            f"{self.base_url}/issues/{urllib.parse.quote(str(issue_id_or_key))}"
-            f"?apiKey={urllib.parse.quote(self.api_key)}"
+        return self._get(
+            f"/issues/{urllib.parse.quote(str(issue_id_or_key))}",
+            allow_404=True,
         )
-        req = urllib.request.Request(url)
-        try:
-            with urllib.request.urlopen(req, timeout=30, context=self.ssl_context) as res:
-                return json.loads(res.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                return None
-            self._handle_http_error(e, f"/issues/{issue_id_or_key}")
 
-    def search_issues_by_keyword(self, project_id: int, keyword: str) -> list:
+    def search_issues_by_keyword(self, project_id: int, keyword: str):
         """
-        keyword でプロジェクト内の課題を検索（ページネーション対応）。
+        keyword でプロジェクト内の課題を遅延列挙する（ページネーション対応）。
+        ジェネレータのため、呼び出し元が途中で打ち切れば以降のページは取得しない。
         Backlog の keyword 検索は summary + description を対象とするため、
-        呼び出し元で summary の完全一致フィルタを行うこと。
+        呼び出し元で summary のフィルタを行うこと。
         """
-        all_issues = []
         offset = 0
         count = 100
         while True:
@@ -256,13 +234,12 @@ class BacklogClient:
                 "offset": offset,
             })
             if not issues:
-                break
-            all_issues.extend(issues)
+                return
+            yield from issues
             if len(issues) < count:
-                break
+                return
             offset += count
             time.sleep(0.3)
-        return all_issues
 
     # ------------------------------------------------------------------
     # 課題の作成・更新
@@ -390,9 +367,9 @@ def find_existing_by_summary(
     件名に summary を含む課題を返す。なければ None。
     keyword 検索は summary + description を対象とするため、
     件名への部分一致フィルタを行う。
+    検索結果は遅延列挙されるため、最初にマッチした時点で以降のページは取得しない。
     """
-    candidates = client.search_issues_by_keyword(project_id, summary)
-    for issue in candidates:
+    for issue in client.search_issues_by_keyword(project_id, summary):
         if summary in issue.get("summary", ""):
             return issue
     return None
@@ -460,18 +437,21 @@ def run(args: argparse.Namespace, config: dict) -> None:
         sys.exit(1)
     source_desc = source_issue.get("description") or ""
 
-    # 4. 対象プロジェクトキーを確定
+    # 4-5. 対象プロジェクトのキーと ID を確定
     # Backlog API の単一課題レスポンスには projectId（数値）のみ含まれ project オブジェクトはない。
-    # issueKey（例: PROJ-123）のプレフィックスをプロジェクトキーとして使用する。
-    target_project_key = (
-        clone_cfg.get("target_project_key")
-        or source_issue["issueKey"].rsplit("-", 1)[0]
-    )
-
-    # 5. プロジェクト情報取得（ID解決）
-    print(f"対象プロジェクトを取得中: {target_project_key}")
-    project = client.get_project(target_project_key)
-    project_id = project["id"]
+    # コピー元と同じプロジェクトなら issueKey（例: PROJ-123）のプレフィックスをキーとし、
+    # ID は取得済みの source_issue["projectId"] を流用して API 呼び出しを 1 回節約する。
+    override_key = clone_cfg.get("target_project_key")
+    if override_key:
+        target_project_key = override_key
+        print(f"対象プロジェクトを取得中: {target_project_key}")
+        project_id = client.get_project(target_project_key)["id"]
+    else:
+        target_project_key = source_issue["issueKey"].rsplit("-", 1)[0]
+        project_id = source_issue.get("projectId")
+        if project_id is None:
+            print(f"対象プロジェクトを取得中: {target_project_key}")
+            project_id = client.get_project(target_project_key)["id"]
 
     # 6. issueTypeId / priorityId を解決
     issue_type_id, issue_type_name = resolve_issue_type_id(

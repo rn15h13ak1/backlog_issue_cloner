@@ -4,8 +4,6 @@ Backlog 課題クローンツール ユニットテスト
 BacklogClient をモック化して、API 接続なしで動作を検証する。
 """
 
-import sys
-import types
 import unittest
 from io import StringIO
 from unittest.mock import MagicMock, patch
@@ -60,6 +58,63 @@ class TestFindExistingBySummary(unittest.TestCase):
         client = self._make_client(issues)
         result = sut.find_existing_by_summary(client, 10, "【定期】20260828 タスク")
         self.assertEqual(result["issueKey"], "PROJ-1")
+
+
+class TestSearchIssuesPagination(unittest.TestCase):
+    """search_issues_by_keyword — 遅延列挙による短絡を検証。"""
+
+    TARGET = "【定期】20260828 タスク"
+
+    def _client(self):
+        return sut.BacklogClient(space_host="test.backlog.com", api_key="TESTKEY")
+
+    @staticmethod
+    def _page(n, summary="無関係な課題"):
+        return [{"issueKey": f"PROJ-{i}", "summary": summary} for i in range(n)]
+
+    def test_stops_at_first_page_when_match_found(self):
+        """1ページ目にマッチがあれば2ページ目は取得しない。"""
+        client = self._client()
+        pages = [
+            self._page(99) + [{"issueKey": "PROJ-HIT", "summary": self.TARGET}],
+            self._page(100),
+        ]
+        with patch.object(client, "_get", side_effect=pages) as mock_get, \
+             patch("backlog_issue_cloner.time.sleep") as mock_sleep:
+            result = sut.find_existing_by_summary(client, 10, self.TARGET)
+        self.assertEqual(result["issueKey"], "PROJ-HIT")
+        self.assertEqual(mock_get.call_count, 1)
+        mock_sleep.assert_not_called()
+
+    def test_fetches_next_page_when_no_match_on_first(self):
+        """1ページ目が満杯かつ未ヒットなら次ページを取得する。"""
+        client = self._client()
+        pages = [
+            self._page(100),
+            [{"issueKey": "PROJ-HIT", "summary": self.TARGET}],
+        ]
+        with patch.object(client, "_get", side_effect=pages) as mock_get, \
+             patch("backlog_issue_cloner.time.sleep"):
+            result = sut.find_existing_by_summary(client, 10, self.TARGET)
+        self.assertEqual(result["issueKey"], "PROJ-HIT")
+        self.assertEqual(mock_get.call_count, 2)
+        self.assertEqual(mock_get.call_args_list[1][0][1]["offset"], 100)
+
+    def test_stops_when_page_is_not_full(self):
+        """満杯でないページで打ち切り、マッチしなければ None。"""
+        client = self._client()
+        with patch.object(client, "_get", side_effect=[self._page(5)]) as mock_get, \
+             patch("backlog_issue_cloner.time.sleep"):
+            result = sut.find_existing_by_summary(client, 10, self.TARGET)
+        self.assertIsNone(result)
+        self.assertEqual(mock_get.call_count, 1)
+
+    def test_empty_first_page_returns_none(self):
+        client = self._client()
+        with patch.object(client, "_get", side_effect=[[]]) as mock_get:
+            result = sut.find_existing_by_summary(client, 10, self.TARGET)
+        self.assertIsNone(result)
+        self.assertEqual(mock_get.call_count, 1)
 
 
 # ===========================================================================
@@ -345,9 +400,26 @@ class TestRunExecute(unittest.TestCase):
         mock_client.create_issue.assert_not_called()
         mock_client.update_issue.assert_not_called()
 
-    def test_project_key_derived_from_issue_key(self):
-        """target_project_key 未設定時は issueKey プレフィックスから導出される。"""
+    def test_project_id_reused_from_source_issue(self):
+        """target_project_key 未設定時は source_issue の projectId を流用し get_project を呼ばない。"""
         patcher, mock_client = self._patch_client()
+        with patcher, \
+             patch("sys.stdout", new_callable=StringIO), \
+             patch("builtins.input", return_value="n"):
+            sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        mock_client.get_project.assert_not_called()
+        # 重複チェックは source_issue の projectId で行われる
+        mock_client.search_issues_by_keyword.assert_called_once_with(
+            10, "【定期】20260828 タスク"
+        )
+
+    def test_project_key_derived_when_project_id_missing(self):
+        """projectId が無い場合は issueKey プレフィックスで get_project にフォールバックする。"""
+        patcher, mock_client = self._patch_client()
+        source_without_project_id = {
+            k: v for k, v in SOURCE_ISSUE.items() if k != "projectId"
+        }
+        mock_client.get_issue.return_value = source_without_project_id
         with patcher, \
              patch("sys.stdout", new_callable=StringIO), \
              patch("builtins.input", return_value="n"):
