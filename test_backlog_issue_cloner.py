@@ -9,6 +9,7 @@ import io
 import json
 import unittest
 import urllib.error
+import urllib.parse
 from contextlib import contextmanager
 from io import StringIO
 from unittest.mock import MagicMock, patch
@@ -209,6 +210,53 @@ class TestSearchIssuesPagination(unittest.TestCase):
         with patch.object(client, "_get", side_effect=[[]]) as mock_get:
             list(client.search_issues_by_keyword(10, "件名"))
         self.assertNotIn("statusId", mock_get.call_args[0][1])
+
+
+# ===========================================================================
+# パラメータ展開テスト
+# ===========================================================================
+
+
+class TestFlattenParams(unittest.TestCase):
+    """_flatten_params — GET のクエリと POST のボディで共用する展開処理。"""
+
+    def test_scalar_values(self):
+        self.assertEqual(
+            sut._flatten_params({"keyword": "件名", "count": 100}),
+            [("keyword", "件名"), ("count", "100")],
+        )
+
+    def test_list_values_expanded_with_brackets(self):
+        self.assertEqual(
+            sut._flatten_params({"statusId": [1, 2, 3]}),
+            [("statusId[]", "1"), ("statusId[]", "2"), ("statusId[]", "3")],
+        )
+
+    def test_mixed(self):
+        self.assertEqual(
+            sut._flatten_params({"projectId": [10], "offset": 0}),
+            [("projectId[]", "10"), ("offset", "0")],
+        )
+
+    def test_empty_list_produces_no_pair(self):
+        self.assertEqual(sut._flatten_params({"statusId": []}), [])
+
+    def test_query_encoding_round_trips(self):
+        """クエリ文字列に組み立てた後、パースして元の値に戻ることを確認する。"""
+        params = {"statusId": [1, 2], "keyword": "a/b c&d=e 【定期】"}
+        query = urllib.parse.urlencode(
+            sut._flatten_params(params), quote_via=urllib.parse.quote
+        )
+        parsed = urllib.parse.parse_qs(query)
+        self.assertEqual(parsed["statusId[]"], ["1", "2"])
+        self.assertEqual(parsed["keyword"], ["a/b c&d=e 【定期】"])
+
+    def test_body_encoding_round_trips(self):
+        params = {"summary": "件名 テスト", "description": "改行\nあり"}
+        body = urllib.parse.urlencode(sut._flatten_params(params))
+        parsed = urllib.parse.parse_qs(body)
+        self.assertEqual(parsed["summary"], ["件名 テスト"])
+        self.assertEqual(parsed["description"], ["改行\nあり"])
 
 
 # ===========================================================================
@@ -787,6 +835,55 @@ class TestRunExecute(unittest.TestCase):
             outcome = sut.run(_make_args(execute=True, date="20260828"), _make_config())
         mock_client.create_issue.assert_not_called()
         self.assertEqual(outcome, sut.OUTCOME_SKIPPED)
+
+    # --- 種別・優先度の遅延解決（不要な API 呼び出しの抑止） ---
+
+    def test_no_change_skips_type_and_priority_lookup(self):
+        """変更なしの経路では種別・優先度を取得しない。"""
+        patcher, mock_client = _mock_client(existing_issue=EXISTING_SAME)
+        with patcher, patch("sys.stdout", new_callable=StringIO):
+            sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        mock_client.get_issue_types.assert_not_called()
+        mock_client.get_priorities.assert_not_called()
+
+    def test_update_skips_type_and_priority_lookup(self):
+        """更新の経路でも種別・優先度は使わないので取得しない。"""
+        patcher, mock_client = _mock_client(existing_issue=EXISTING_DIFF)
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        mock_client.update_issue.assert_called_once()
+        mock_client.get_issue_types.assert_not_called()
+        mock_client.get_priorities.assert_not_called()
+
+    def test_create_resolves_type_and_priority(self):
+        """新規作成の経路では種別・優先度を取得して作成パラメータに含める。"""
+        patcher, mock_client = _mock_client()
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        mock_client.get_issue_types.assert_called_once()
+        mock_client.get_priorities.assert_called_once()
+        params = mock_client.create_issue.call_args[0][0]
+        self.assertEqual(params["issueTypeId"], 1)
+        self.assertEqual(params["priorityId"], 3)
+
+    def test_dry_run_create_still_resolves_type_and_priority(self):
+        """ドライランでも作成予定なら種別名の存在確認のため解決する。"""
+        patcher, mock_client = _mock_client()
+        with patcher, patch("sys.stdout", new_callable=StringIO):
+            outcome = sut.run(_make_args(execute=False, date="20260828"), _make_config())
+        self.assertEqual(outcome, sut.OUTCOME_CREATED)
+        mock_client.get_issue_types.assert_called_once()
+        mock_client.get_priorities.assert_called_once()
+        mock_client.create_issue.assert_not_called()
+
+    def test_dry_run_no_change_skips_lookup(self):
+        patcher, mock_client = _mock_client(existing_issue=EXISTING_SAME)
+        with patcher, patch("sys.stdout", new_callable=StringIO):
+            sut.run(_make_args(execute=False, date="20260828"), _make_config())
+        mock_client.get_issue_types.assert_not_called()
+        mock_client.get_priorities.assert_not_called()
 
     # --- プロジェクト解決 ---
 

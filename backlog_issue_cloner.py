@@ -95,6 +95,31 @@ NUMERIC_SETTINGS = (
 )
 
 
+# HTTP ステータスごとの対処のヒント
+HTTP_ERROR_HINTS = {
+    400: "リクエストパラメータを確認してください。",
+    401: "api_key を確認してください。",
+    403: "api_key の権限を確認してください。",
+    404: "space_host または project_key を確認してください。",
+    429: "レート制限に達しました。しばらく待って再実行してください。",
+}
+
+
+def _flatten_params(params: dict) -> list[tuple[str, str]]:
+    """
+    パラメータ dict を (キー, 値) のペア列に展開する。
+    リスト値は Backlog API が要求する key[]=v1&key[]=v2 形式に展開する。
+    GET のクエリ文字列と POST/PATCH のボディの双方で使う。
+    """
+    pairs = []
+    for key, value in params.items():
+        if isinstance(value, list):
+            pairs.extend((f"{key}[]", str(v)) for v in value)
+        else:
+            pairs.append((str(key), str(value)))
+    return pairs
+
+
 def _close_quietly(resource) -> None:
     """HTTPError などのレスポンスを例外を出さずに解放する。
 
@@ -145,21 +170,6 @@ class BacklogClient:
     # 内部ユーティリティ
     # ------------------------------------------------------------------
 
-    def _build_query(self, params: dict) -> str:
-        """パラメータ dict をクエリ文字列に変換（リスト値は [] 展開）"""
-        parts = []
-        for key, value in params.items():
-            if isinstance(value, list):
-                for v in value:
-                    parts.append(
-                        f"{urllib.parse.quote(f'{key}[]')}={urllib.parse.quote(str(v))}"
-                    )
-            else:
-                parts.append(
-                    f"{urllib.parse.quote(str(key))}={urllib.parse.quote(str(value))}"
-                )
-        return "&".join(parts)
-
     def _handle_http_error(
         self,
         e: urllib.error.HTTPError,
@@ -198,14 +208,7 @@ class BacklogClient:
         elif raw_body:
             message += f"\n  レスポンス: {raw_body[:500]}"
 
-        hints = {
-            400: "リクエストパラメータを確認してください。",
-            401: "api_key を確認してください。",
-            403: "api_key の権限を確認してください。",
-            404: "space_host または project_key を確認してください。",
-            429: "レート制限に達しました。しばらく待って再実行してください。",
-        }
-        raise BacklogError(message, status=e.code, hint=hints.get(e.code))
+        raise BacklogError(message, status=e.code, hint=HTTP_ERROR_HINTS.get(e.code))
 
     def _retry_delay(self, error: urllib.error.HTTPError | None, attempt: int) -> float:
         """リトライまでの待機秒数。Retry-After ヘッダがあれば優先する。"""
@@ -250,7 +253,7 @@ class BacklogClient:
                 with urllib.request.urlopen(
                     req, timeout=self.timeout, context=self.ssl_context
                 ) as res:
-                    return json.loads(res.read().decode("utf-8"))
+                    return json.load(res)
             except urllib.error.HTTPError as e:
                 # HTTPError は URLError のサブクラスなので必ず先に捕捉する
                 if allow_404 and e.code == 404:
@@ -303,7 +306,10 @@ class BacklogClient:
         """GET リクエストを送信する。allow_404 が True なら 404 時に None を返す。"""
         params = dict(params or {})
         params["apiKey"] = self.api_key
-        query = self._build_query(params)
+        # クエリ文字列では空白を + ではなく %20 にするため quote を使う
+        query = urllib.parse.urlencode(
+            _flatten_params(params), quote_via=urllib.parse.quote
+        )
         url = f"{self.base_url}{endpoint}?{query}"
 
         if self.debug:
@@ -324,18 +330,8 @@ class BacklogClient:
         """フォームエンコードのボディを持つリクエスト（POST / PATCH）を送信する。"""
         url = f"{self.base_url}{endpoint}?apiKey={urllib.parse.quote(self.api_key)}"
 
-        body_parts = []
-        for key, value in params.items():
-            if isinstance(value, list):
-                for v in value:
-                    body_parts.append((f"{key}[]", str(v)))
-            else:
-                body_parts.append((key, str(value)))
-
-        body = "&".join(
-            f"{k}={urllib.parse.quote_plus(v)}"
-            for k, v in body_parts
-        ).encode("utf-8")
+        body_parts = _flatten_params(params)
+        body = urllib.parse.urlencode(body_parts).encode("utf-8")
 
         if self.debug:
             print(f"  [DEBUG {method}] {endpoint}", file=sys.stderr)
@@ -697,32 +693,24 @@ def run(args: argparse.Namespace, config: dict) -> str:
             print(f"対象プロジェクトを取得中: {target_project_key}")
             project_id = client.get_project(target_project_key)["id"]
 
-    # 5. issueTypeId / priorityId を解決
-    issue_type_id, issue_type_name = resolve_issue_type_id(
-        client, target_project_key, clone_cfg.get("issue_type")
-    )
-    priority_id, priority_name = resolve_priority_id(
-        client, clone_cfg.get("priority")
-    )
-
-    # 6. 重複検出の条件を確定
+    # 5. 重複検出の条件を確定
     match_mode = clone_cfg.get("match_mode", "substring")
     include_closed = bool(clone_cfg.get("include_closed", False))
     status_ids = None if include_closed else STATUS_IDS_OPEN
 
-    # 7. 解決済み設定値を表示
+    # 6. 解決済み設定値を表示
+    # 種別・優先度は新規作成でしか使わないため、ここでは解決しない。
+    # 更新・変更なしの経路で無駄な API 呼び出しを 2 回省くため。
     prefix = "[DRY RUN] " if dry_run else ""
     print(f"\n{prefix}設定値:")
     print(f"  件名        : {summary}")
     print(f"  コピー元    : {source_key}")
     print(f"  対象PJ      : {target_project_key} (id={project_id})")
-    print(f"  種別        : {issue_type_name} (id={issue_type_id})")
-    print(f"  優先度      : {priority_name} (id={priority_id})")
     print(f"  本文文字数  : {len(source_desc)} 文字")
     print(f"  重複判定    : {match_mode}"
           f"（完了済み課題を{'含む' if include_closed else '除く'}）")
 
-    # 8. 重複チェック
+    # 7. 重複チェック
     print(f"\n既存課題を検索中（件名: {summary!r}）...")
     existing = find_existing_by_summary(
         client, project_id, summary, match_mode=match_mode, status_ids=status_ids
@@ -757,7 +745,17 @@ def run(args: argparse.Namespace, config: dict) -> str:
         print(f"更新完了: {updated['issueKey']} — {updated['summary']}")
         return OUTCOME_UPDATED
 
-    # 9. 既存課題なし → 新規作成フロー
+    # 8. 既存課題なし → 新規作成フロー
+    # ここで初めて種別・優先度を解決する（作成時にしか使わないため）
+    issue_type_id, issue_type_name = resolve_issue_type_id(
+        client, target_project_key, clone_cfg.get("issue_type")
+    )
+    priority_id, priority_name = resolve_priority_id(
+        client, clone_cfg.get("priority")
+    )
+    print(f"  種別        : {issue_type_name} (id={issue_type_id})")
+    print(f"  優先度      : {priority_name} (id={priority_id})")
+
     if dry_run:
         print("[DRY RUN] 新規課題を作成します:")
         print(f"  件名: {summary}")
