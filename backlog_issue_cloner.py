@@ -36,6 +36,7 @@ Backlog 課題クローンツール
 
 import argparse
 import json
+import re
 import ssl
 import sys
 import time
@@ -872,6 +873,32 @@ class ChildPlan:
     existing: dict | None = None  # 複製先に既にある子課題
 
 
+_DIGITS_RE = re.compile(r"(\d+)")
+
+
+def summary_sort_key(summary: str) -> list:
+    """
+    件名の並び順を決めるキー。数字は数値として比較するため
+    「手順2」が「手順10」より前に来る（単純な文字列比較では逆になる）。
+    """
+    return [
+        (0, int(part), "") if part.isdigit() else (1, 0, part)
+        for part in _DIGITS_RE.split(summary or "") if part
+    ]
+
+
+def sort_issues_by_summary(issues: list) -> list:
+    """
+    課題を件名順に並べる。Backlog API の返却順は一定ではないため、
+    実行するたびに作成順（＝採番される課題キーの順）が変わらないようにする。
+    件名が同じ場合は課題 ID で並べて順序を確定させる。
+    """
+    return sorted(
+        issues,
+        key=lambda i: (summary_sort_key(i.get("summary", "")), i.get("id") or 0),
+    )
+
+
 def build_summary(template: str, source_summary: str, date_str: str) -> str:
     """
     件名テンプレートを展開する。親課題・子課題の双方で使う。
@@ -1101,7 +1128,9 @@ def run(args: argparse.Namespace, config: dict) -> str:
             )
         else:
             print("コピー元の子課題を取得中...")
-            source_children = list(client.get_child_issues(source_issue["id"]))
+            source_children = sort_issues_by_summary(
+                client.get_child_issues(source_issue["id"])
+            )
             print(f"  子課題: {len(source_children)} 件")
 
     # 4. 重複検出の条件を確定
@@ -1203,7 +1232,8 @@ def run(args: argparse.Namespace, config: dict) -> str:
         parent_action = OUTCOME_NO_CHANGE if same else OUTCOME_UPDATED
         # 既存の親に紐づく子課題を照合対象にする
         existing_children = (
-            list(client.get_child_issues(existing["id"])) if source_children else []
+            sort_issues_by_summary(client.get_child_issues(existing["id"]))
+            if source_children else []
         )
 
     # 9. 子課題の操作を決める

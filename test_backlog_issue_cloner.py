@@ -874,6 +874,61 @@ class TestBuildSummary(unittest.TestCase):
         self.assertEqual(sut.build_summary("固定", "元", "20260828"), "固定")
 
 
+class TestSortIssuesBySummary(unittest.TestCase):
+    """API の返却順に依存せず、実行のたびに同じ順で作成されるようにする。"""
+
+    def _issues(self, *summaries):
+        return [{"id": i, "issueKey": f"P-{i}", "summary": s}
+                for i, s in enumerate(summaries, 1)]
+
+    def _order(self, issues):
+        return [i["summary"] for i in sut.sort_issues_by_summary(issues)]
+
+    def test_sorted_by_summary(self):
+        issues = self._issues("手順3 報告", "手順1 バックアップ", "手順2 検証")
+        self.assertEqual(
+            self._order(issues), ["手順1 バックアップ", "手順2 検証", "手順3 報告"]
+        )
+
+    def test_numbers_compared_numerically(self):
+        """単純な文字列比較では「手順10」が「手順2」より前に来てしまう。"""
+        issues = self._issues("手順10", "手順2", "手順1")
+        self.assertEqual(self._order(issues), ["手順1", "手順2", "手順10"])
+
+    def test_zero_padded_numbers(self):
+        issues = self._issues("手順03", "手順1", "手順02")
+        self.assertEqual(self._order(issues), ["手順1", "手順02", "手順03"])
+
+    def test_same_summary_is_ordered_by_id(self):
+        issues = [
+            {"id": 20, "summary": "同じ件名"},
+            {"id": 10, "summary": "同じ件名"},
+        ]
+        self.assertEqual([i["id"] for i in sut.sort_issues_by_summary(issues)], [10, 20])
+
+    def test_result_is_stable_regardless_of_input_order(self):
+        import itertools
+        summaries = ["手順10", "手順2", "あ", "Zebra", "手順1"]
+        orders = {
+            tuple(self._order(self._issues(*perm)))
+            for perm in itertools.permutations(summaries)
+        }
+        self.assertEqual(len(orders), 1, f"入力順で結果が変わる: {orders}")
+
+    def test_missing_summary_does_not_raise(self):
+        issues = [{"id": 1}, {"id": 2, "summary": "あ"}]
+        self.assertEqual(len(sut.sort_issues_by_summary(issues)), 2)
+
+    def test_empty(self):
+        self.assertEqual(sut.sort_issues_by_summary([]), [])
+
+    def test_accepts_generator(self):
+        """クライアントは遅延列挙のジェネレータを返す。"""
+        gen = (i for i in self._issues("い", "あ"))
+        self.assertEqual([i["summary"] for i in sut.sort_issues_by_summary(gen)],
+                         ["あ", "い"])
+
+
 class TestBuildChildPlans(unittest.TestCase):
     OPTS = dict(template="{SOURCE_SUMMARY}", date_str="20260828", match_mode="substring")
 
@@ -2045,6 +2100,44 @@ class TestRunWithChildren(unittest.TestCase):
         # 親の作成レスポンスの id が子の parentIssueId になる
         self.assertTrue(all(p["parentIssueId"] == 2001 for p in child_params))
         self.assertEqual([p["description"] for p in child_params], ["本文1", "本文2"])
+
+    def test_children_are_created_in_summary_order(self):
+        """API の返却順に関わらず件名順に作成し、採番される課題キーを安定させる。"""
+        shuffled = [
+            _child(103, "PROJ-4", "手順10 完了報告", "本文10"),
+            _child(101, "PROJ-2", "手順2 検証", "本文2"),
+            _child(102, "PROJ-3", "手順1 バックアップ", "本文1"),
+        ]
+        _, mc, _ = self._run(source_children=shuffled)
+        created = [c[0][0]["summary"] for c in mc.create_issue.call_args_list[1:]]
+        self.assertEqual(
+            created, ["手順1 バックアップ", "手順2 検証", "手順10 完了報告"]
+        )
+
+    def test_creation_order_does_not_depend_on_api_order(self):
+        import itertools
+        children = [
+            _child(101, "PROJ-2", "手順1", "本文1"),
+            _child(102, "PROJ-3", "手順2", "本文2"),
+            _child(103, "PROJ-4", "手順3", "本文3"),
+        ]
+        orders = set()
+        for perm in itertools.permutations(children):
+            _, mc, _ = self._run(source_children=list(perm))
+            orders.add(tuple(
+                c[0][0]["summary"] for c in mc.create_issue.call_args_list[1:]
+            ))
+        self.assertEqual(len(orders), 1, f"返却順で作成順が変わる: {orders}")
+
+    def test_plan_is_displayed_in_summary_order(self):
+        shuffled = [
+            _child(103, "PROJ-4", "手順10 完了報告", "本文10"),
+            _child(101, "PROJ-2", "手順1 バックアップ", "本文1"),
+        ]
+        _, _, out = self._run(source_children=shuffled, execute=False)
+        lines = [l for l in out.splitlines() if "[子]" in l]
+        self.assertIn("手順1 バックアップ", lines[0])
+        self.assertIn("手順10 完了報告", lines[1])
 
     def test_child_inherits_issue_type_and_priority(self):
         _, mc, _ = self._run(source_children=self.SOURCE_CHILDREN)
