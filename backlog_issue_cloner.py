@@ -39,6 +39,7 @@ import json
 import ssl
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -841,6 +842,18 @@ ACTION_LABELS = {
 }
 
 
+def display_width(text: str) -> int:
+    """端末上の表示幅。全角文字を 2 桁として数える。"""
+    return sum(
+        2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in text
+    )
+
+
+def pad(text: str, width: int) -> str:
+    """表示幅を揃えて右側を空白で埋める。ラベルの文字数が違っても桁がずれない。"""
+    return text + " " * max(0, width - display_width(text))
+
+
 def print_plan(
     parent_action: str,
     parent_summary: str,
@@ -851,10 +864,10 @@ def print_plan(
     """これから行う操作の一覧を表示する。"""
     print("\n実行内容:")
     where = f"（{parent_existing['issueKey']}）" if parent_existing else ""
-    print(f"  [親] {ACTION_LABELS[parent_action]:8} {parent_summary}{where}")
+    print(f"  [親] {pad(ACTION_LABELS[parent_action], 12)}{parent_summary}{where}")
     for plan in child_plans:
         where = f"（{plan.existing['issueKey']}）" if plan.existing else ""
-        print(f"  [子] {ACTION_LABELS[plan.action]:8} {plan.summary}{where}")
+        print(f"  [子] {pad(ACTION_LABELS[plan.action], 12)}{plan.summary}{where}")
 
     # 新規作成が発生し、かつ複製先に照合できなかった子課題がある場合のみ警告する。
     # 複製先で件名が変更されていると照合に失敗し、同じ内容の子課題が

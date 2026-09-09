@@ -873,6 +873,20 @@ class TestConfirm(unittest.TestCase):
         text = self._print_plan([self._plan(sut.OUTCOME_CREATED, "手順2")], [])
         self.assertNotIn("警告", text)
 
+    def test_labels_are_aligned_regardless_of_length(self):
+        """新規作成(4文字)と本文を更新(5文字)で件名の開始位置がずれない。"""
+        text = self._print_plan(
+            [self._plan(sut.OUTCOME_CREATED, "子A"),
+             self._plan(sut.OUTCOME_UPDATED, "子B"),
+             self._plan(sut.OUTCOME_NO_CHANGE, "子C")],
+            [],
+        )
+        starts = {
+            sut.display_width(line.split("子")[0])
+            for line in text.splitlines() if "[子]" in line
+        }
+        self.assertEqual(len(starts), 1, f"件名の開始位置がずれている: {starts}")
+
     def test_print_plan_lists_parent_and_children(self):
         out = StringIO()
         with patch("sys.stdout", out):
@@ -892,6 +906,26 @@ class TestConfirm(unittest.TestCase):
 # ===========================================================================
 # 終了コードテスト
 # ===========================================================================
+
+
+class TestDisplayWidth(unittest.TestCase):
+    def test_ascii_counts_one_each(self):
+        self.assertEqual(sut.display_width("abc12"), 5)
+
+    def test_full_width_counts_two_each(self):
+        self.assertEqual(sut.display_width("新規作成"), 8)
+        self.assertEqual(sut.display_width("本文を更新"), 10)
+
+    def test_mixed(self):
+        # 半角 7 文字 + 全角 2 文字
+        self.assertEqual(sut.display_width("PROJ-1 課題"), 11)
+
+    def test_pad_fills_to_display_width(self):
+        self.assertEqual(sut.display_width(sut.pad("新規作成", 12)), 12)
+        self.assertEqual(sut.display_width(sut.pad("本文を更新", 12)), 12)
+
+    def test_pad_does_not_truncate(self):
+        self.assertEqual(sut.pad("長すぎるラベル", 4), "長すぎるラベル")
 
 
 class TestExitCode(unittest.TestCase):
