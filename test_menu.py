@@ -26,8 +26,14 @@ class TestIsIssueKey(unittest.TestCase):
         for key in ("PROJ-1", "PROJ-123", "A1-9", "MY_PROJ-42"):
             self.assertTrue(menu.is_issue_key(key), key)
 
+    def test_project_key_may_start_with_digit_or_underscore(self):
+        """Backlog のプロジェクトキーは数字やアンダースコアで始められる。"""
+        for key in ("10_AAA-20", "1-1", "_X-1", "2024_PROJ-100"):
+            self.assertTrue(menu.is_issue_key(key), key)
+
     def test_invalid(self):
-        for key in ("PROJ", "123", "-1", "PROJ-", "PROJ 1", "", "1PROJ-1", "PROJ-1.2"):
+        for key in ("PROJ", "123", "-1", "PROJ-", "PROJ 1", "", "PROJ-1.2",
+                    "PROJ-1-2", "PROJ-abc", "日本語-1"):
             self.assertFalse(menu.is_issue_key(key), key)
 
 

@@ -29,7 +29,10 @@ SCRIPT = TOOL_DIR / "backlog_issue_cloner.py"
 HISTORY_PATH = Path.home() / ".backlog_issue_cloner_menu.json"
 
 # 課題キーの形式（例: PROJ-123）
-ISSUE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-\d+$")
+# Backlog のプロジェクトキーには英字・数字・アンダースコアが使え、
+# 数字やアンダースコアで始まるもの（例: 10_AAA-20）も有効。
+# ハイフンはプロジェクトキーには使えないため、末尾の -数字 が課題番号になる。
+ISSUE_KEY_RE = re.compile(r"^[A-Za-z0-9_]+-\d+$")
 
 MODE_SIMPLE = "simple"
 MODE_PERIODIC = "periodic"
@@ -230,7 +233,7 @@ def collect_inputs(mode: str, history: dict) -> dict | None:
         "コピー元の課題キー",
         default=history.get("source_issue_key", ""),
         validate=is_issue_key,
-        hint="PROJ-123 の形式で入力してください。",
+        hint="「プロジェクトキー-番号」の形式で入力してください（例: PROJ-123, 10_AAA-20）。",
     )
     if not source_key:
         return None
@@ -255,7 +258,7 @@ def collect_inputs(mode: str, history: dict) -> dict | None:
             "複製先の課題キー",
             default=history.get("target_issue_key", ""),
             validate=is_issue_key,
-            hint="PROJ-456 の形式で入力してください。",
+            hint="「プロジェクトキー-番号」の形式で入力してください（例: PROJ-456, 10_AAA-21）。",
         )
         if not target_key:
             return None
