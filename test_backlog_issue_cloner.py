@@ -674,6 +674,31 @@ class TestResolveIssueTypeId(unittest.TestCase):
         self.assertEqual(id_, 1)
         self.assertEqual(name, "タスク")
 
+    # --- コピー元の種別を引き継ぐ ---
+
+    def test_inherits_source_issue_type(self):
+        """設定が無ければコピー元と同じ種別を使う（最初の種別ではない）。"""
+        source = {"issueType": {"id": 3, "name": "要望"}}
+        id_, name = sut.resolve_issue_type_id(self.TYPES, None, source)
+        self.assertEqual((id_, name), (3, "要望"))
+
+    def test_configured_name_wins_over_source(self):
+        source = {"issueType": {"id": 3, "name": "要望"}}
+        id_, name = sut.resolve_issue_type_id(self.TYPES, "バグ", source)
+        self.assertEqual((id_, name), (2, "バグ"))
+
+    def test_falls_back_to_first_when_source_type_absent(self):
+        source = {"issueType": {"id": 9, "name": "複製先に無い種別"}}
+        with patch("sys.stderr", new_callable=StringIO) as err:
+            id_, name = sut.resolve_issue_type_id(self.TYPES, None, source)
+        self.assertEqual((id_, name), (1, "タスク"))
+        self.assertIn("複製先に無い種別", err.getvalue())
+
+    def test_source_without_issue_type(self):
+        for source in ({}, {"issueType": None}):
+            id_, name = sut.resolve_issue_type_id(self.TYPES, None, source)
+            self.assertEqual((id_, name), (1, "タスク"))
+
     def test_fetch_raises_when_empty(self):
         client = MagicMock()
         client.get_issue_types.return_value = []
@@ -1445,6 +1470,36 @@ class TestRunExecute(unittest.TestCase):
             sut.run(_make_args(execute=True, date="20260828"), _make_config())
         self.assertEqual(
             [c[0][0] for c in mock_client.get_issue.call_args_list], ["PROJ-1"]
+        )
+
+    def test_parent_inherits_source_issue_type(self):
+        """種別ごとに必須のカスタム属性が変わるため、既定でコピー元に揃える。"""
+        patcher, mock_client = _mock_client()
+        # プロジェクトの最初の種別は「バグ」だが、コピー元は「タスク」
+        mock_client.get_issue_types.return_value = [
+            {"id": 2, "name": "バグ"}, {"id": 1, "name": "タスク"},
+        ]
+        mock_client.get_issue.return_value = {
+            **SOURCE_ISSUE, "issueType": {"id": 1, "name": "タスク"}
+        }
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        self.assertEqual(
+            mock_client.create_issue.call_args[0][0]["issueTypeId"], 1
+        )
+
+    def test_configured_issue_type_overrides_source(self):
+        cfg = _make_config(issue_type="バグ")
+        patcher, mock_client = _mock_client()
+        mock_client.get_issue.return_value = {
+            **SOURCE_ISSUE, "issueType": {"id": 1, "name": "タスク"}
+        }
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"), cfg)
+        self.assertEqual(
+            mock_client.create_issue.call_args[0][0]["issueTypeId"], 2
         )
 
     def test_configured_custom_fields_fill_in_empty_source_value(self):

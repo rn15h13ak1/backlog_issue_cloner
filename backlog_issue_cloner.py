@@ -722,18 +722,41 @@ def fetch_priorities(client: BacklogClient) -> list:
     return priorities
 
 
-def resolve_issue_type_id(types: list, name: str | None) -> tuple[int, str]:
-    """種別IDと種別名を返す。見つからない場合は警告して最初の種別にフォールバック。"""
+def resolve_issue_type_id(
+    types: list, name: str | None, source_issue: dict | None = None
+) -> tuple[int, str]:
+    """
+    種別IDと種別名を返す。優先順位は次のとおり。
+
+      1. 設定の clone.issue_type で指定された種別
+      2. コピー元課題と同じ種別
+      3. プロジェクトの最初の種別
+
+    Backlog はカスタム属性の必須設定を種別ごとに持つため、既定でコピー元に
+    揃えないと、コピー元では不要な属性が必須の種別で作成されて失敗する。
+    """
     if name:
         matched = [t for t in types if t["name"] == name]
         if matched:
             return matched[0]["id"], matched[0]["name"]
         available = [t["name"] for t in types]
         print(
-            f"警告: 種別「{name}」が見つかりません。最初の種別「{types[0]['name']}」を使用します。"
+            f"警告: 種別「{name}」が見つかりません。"
             f"（利用可能: {available}）",
             file=sys.stderr,
         )
+
+    source_name = ((source_issue or {}).get("issueType") or {}).get("name")
+    if source_name:
+        matched = [t for t in types if t["name"] == source_name]
+        if matched:
+            return matched[0]["id"], matched[0]["name"]
+        print(
+            f"警告: コピー元と同じ種別「{source_name}」が複製先にありません。"
+            f"最初の種別「{types[0]['name']}」を使用します。",
+            file=sys.stderr,
+        )
+
     return types[0]["id"], types[0]["name"]
 
 
@@ -1165,7 +1188,7 @@ def run(args: argparse.Namespace, config: dict) -> str:
         issue_types = fetch_issue_types(client, target_project_key)
         priorities = fetch_priorities(client)
         issue_type_id, issue_type_name = resolve_issue_type_id(
-            issue_types, clone_cfg.get("issue_type")
+            issue_types, clone_cfg.get("issue_type"), source_issue
         )
         priority_id, priority_name = resolve_priority_id(
             priorities, clone_cfg.get("priority")
@@ -1301,6 +1324,8 @@ def show_source_issue(args: argparse.Namespace, config: dict) -> None:
         raise ConfigError(f"コピー元課題「{source_key}」が見つかりません。")
 
     print(f"コピー元課題: {issue['issueKey']} — {issue.get('summary', '')}")
+    print(f"  種別: {(issue.get('issueType') or {}).get('name', '（不明）')}"
+          "  ← 設定で指定しない限り、この種別で作成します")
     fields = issue.get("customFields")
     if fields is None:
         print("  カスタム属性: レスポンスに含まれていません")
