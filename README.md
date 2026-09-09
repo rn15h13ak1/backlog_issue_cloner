@@ -786,11 +786,15 @@ python3 -m coverage report -m
 
 メニューの対話ループ本体（`main`）は副作用が大きいため対象外にしています。
 
+改修する場合は [設計仕様書](docs/DESIGN.md) を参照してください。
+設計判断の根拠、Backlog API への依存、変更時に触る場所をまとめています。
+
 ## ファイル構成
 
 | ファイル | 役割 |
 |---|---|
-| `README.md` | このドキュメント |
+| `README.md` | このドキュメント（使う人向け） |
+| `docs/DESIGN.md` | 設計仕様書（保守する人向け。設計判断の根拠と変更ガイド） |
 | `backlog_issue_cloner.py` | 本体（API クライアント + CLI） |
 | `menu.py` | 対話メニュー（本体を subprocess で呼ぶ） |
 | `config.sample.yaml` | 設定ファイルのテンプレート |
