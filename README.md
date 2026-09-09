@@ -786,6 +786,18 @@ python3 -m coverage report -m
 
 メニューの対話ループ本体（`main`）は副作用が大きいため対象外にしています。
 
+### 保守用スクリプト
+
+```bash
+python3 tools/check_docs.py      # ドキュメントと実装の整合を検査する
+python3 tools/mutation_test.py   # テストが退行を検知できるかを測る
+```
+
+`check_docs.py` は設定項目・コマンドラインオプション・終了コードが実装と
+README と `config.sample.yaml` で一致しているか、リンクが切れていないかを確認します。
+`mutation_test.py` は実装にわざとバグを埋め込み、テストが落ちるかを確認します。
+どちらも問題があれば終了コード 1 を返します。
+
 改修する場合は [設計仕様書](docs/DESIGN.md) を参照してください。
 設計判断の根拠、Backlog API への依存、変更時に触る場所をまとめています。
 
@@ -795,6 +807,8 @@ python3 -m coverage report -m
 |---|---|
 | `README.md` | このドキュメント（使う人向け） |
 | `docs/DESIGN.md` | 設計仕様書（保守する人向け。設計判断の根拠と変更ガイド） |
+| `tools/check_docs.py` | ドキュメントと実装の整合を検査する |
+| `tools/mutation_test.py` | テストが退行を検知できるかを測る |
 | `backlog_issue_cloner.py` | 本体（API クライアント + CLI） |
 | `menu.py` | 対話メニュー（本体を subprocess で呼ぶ） |
 | `config.sample.yaml` | 設定ファイルのテンプレート |

@@ -27,10 +27,11 @@
 ## 2. 全体構成
 
 ```
-backlog_issue_cloner.py   本体（API クライアント + 複製ロジック + CLI）  1,584 行
-menu.py                   対話メニュー                                     387 行
+backlog_issue_cloner.py   本体（API クライアント + 複製ロジック + CLI）
+menu.py                   対話メニュー
 config.sample.yaml        設定ファイルのひな形
-tests/                    ユニットテスト                                 3,277 行
+tests/                    ユニットテスト
+tools/                    保守用スクリプト（ドキュメント検査・ミューテーションテスト）
 docs/DESIGN.md            この文書
 README.md                 利用者向けドキュメント
 ```
@@ -273,6 +274,14 @@ Backlog は HTTP 400 のエラーコード 7 を、
 
 **テストと README も同時に直してください。** 実装だけ変えるとドキュメントがずれます。
 
+変更したら次の 3 つを実行してください。
+
+```bash
+python3 -m unittest discover -s tests -t .   # テスト
+python3 tools/check_docs.py                  # ドキュメントとの整合
+python3 tools/mutation_test.py               # テストが退行を検知できるか
+```
+
 ### 複製する項目を増やす
 
 1. `inherited_issue_params()` に変換を追加（作成 API のパラメータ名に合わせる）
@@ -286,7 +295,7 @@ Backlog は HTTP 400 のエラーコード 7 を、
 2. `validate_config()` で型・値を検証する（**黙って無視しない**）
 3. `config.sample.yaml` にコメント付きで追加
 4. README の設定項目表に追加
-5. `tools/check_docs.py` で 3 者の一致を確認
+5. `python3 tools/check_docs.py` で実装・README・サンプルの一致を確認
 
 ### 動作モードを増やす
 
@@ -308,15 +317,23 @@ Backlog は HTTP 400 のエラーコード 7 を、
 python3 -m unittest discover -s tests -t .
 ```
 
-352 件。カバレッジは本体 92% / `menu.py` 84%（branch カバレッジ込み）。
+カバレッジは本体・`menu.py` とも branch カバレッジ込みで測っています（[README](../README.md#開発)）。
 
 ### 何を守っているか
 
 カバレッジ率は「テストが実際に退行を捕まえるか」を表しません。
 実装にわざとバグを埋め込んでテストが落ちるかを測る**ミューテーションテスト**で確認しています。
 
+```bash
+python3 tools/mutation_test.py
+```
+
 過去に実際に起きた不具合（種別を引き継がない、子課題を並べ替えない、
-更新系で 5xx を再試行する、など）を含む 20 件の変異を全件検知しています。
+更新系で 5xx を再試行する、など）を含む変異を全件検知しています。
+`【再現】` が付いた変異が実際の不具合に対応します。
+
+**不具合を直したら、その不具合を再現する変異を `tools/mutation_test.py` に追加してください。**
+同じ退行が二度と通らなくなります。
 
 ### 対象外
 
