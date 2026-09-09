@@ -716,6 +716,21 @@ def build_child_plans(
     return plans
 
 
+def _issue_ref(issue: dict):
+    """課題を識別するキー。id があれば id、無ければ issueKey。"""
+    return issue.get("id", issue.get("issueKey"))
+
+
+def find_unmatched_children(existing_children: list, plans: list[ChildPlan]) -> list:
+    """
+    複製先にあるが、コピー元のどの子課題とも照合できなかった子課題を返す。
+    複製先で件名が変更されると照合に失敗し、同じ内容の子課題が
+    重複して作られるため、実行前に気付けるようにする。
+    """
+    matched = {_issue_ref(p.existing) for p in plans if p.existing is not None}
+    return [c for c in existing_children if _issue_ref(c) not in matched]
+
+
 def resolve_child_issue_type(
     issue_types: list, source_child: dict, fallback: tuple[int, str]
 ) -> tuple[int, str]:
@@ -775,6 +790,7 @@ def print_plan(
     parent_summary: str,
     parent_existing: dict | None,
     child_plans: list[ChildPlan],
+    unmatched_children: list | None = None,
 ) -> None:
     """これから行う操作の一覧を表示する。"""
     print("\n実行内容:")
@@ -783,6 +799,19 @@ def print_plan(
     for plan in child_plans:
         where = f"（{plan.existing['issueKey']}）" if plan.existing else ""
         print(f"  [子] {ACTION_LABELS[plan.action]:8} {plan.summary}{where}")
+
+    # 新規作成が発生し、かつ複製先に照合できなかった子課題がある場合のみ警告する。
+    # 複製先で件名が変更されていると照合に失敗し、同じ内容の子課題が
+    # 重複して作られるため。作成が無ければ重複しないので黙っておく。
+    if unmatched_children and any(p.action == OUTCOME_CREATED for p in child_plans):
+        print("\n  警告: 複製先に照合できなかった子課題があります:")
+        for issue in unmatched_children:
+            print(f"      {issue.get('issueKey')}: {issue.get('summary', '')}")
+        print(
+            "    複製先で件名が変更されていると照合できず、"
+            "同じ内容の子課題が重複して作られます。"
+        )
+        print("    重複させたくない場合はここで中断してください。")
 
 
 def confirm_plan(
@@ -949,7 +978,13 @@ def run(args: argparse.Namespace, config: dict) -> str:
         match_mode=match_mode,
     )
 
-    print_plan(parent_action, summary, existing, child_plans)
+    print_plan(
+        parent_action,
+        summary,
+        existing,
+        child_plans,
+        find_unmatched_children(existing_children, child_plans),
+    )
 
     all_actions = [parent_action] + [p.action for p in child_plans]
     if OUTCOME_CREATED not in all_actions and OUTCOME_UPDATED not in all_actions:

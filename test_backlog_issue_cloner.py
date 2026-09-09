@@ -708,6 +708,34 @@ class TestBuildChildPlans(unittest.TestCase):
         self.assertEqual(sut.build_child_plans([], [], **self.OPTS), [])
 
 
+class TestFindUnmatchedChildren(unittest.TestCase):
+    OPTS = dict(template="{SOURCE_SUMMARY}", date_str="20260828", match_mode="exact")
+
+    def test_renamed_existing_child_is_unmatched(self):
+        sources = [_child(1, "P-2", "手順2 検証")]
+        existing = [_child(9, "D-7", "検証手順")]
+        plans = sut.build_child_plans(sources, existing, **self.OPTS)
+        unmatched = sut.find_unmatched_children(existing, plans)
+        self.assertEqual([c["issueKey"] for c in unmatched], ["D-7"])
+
+    def test_all_matched_returns_empty(self):
+        sources = [_child(1, "P-2", "手順1"), _child(2, "P-3", "手順2")]
+        existing = [_child(9, "D-6", "手順1"), _child(8, "D-7", "手順2")]
+        plans = sut.build_child_plans(sources, existing, **self.OPTS)
+        self.assertEqual(sut.find_unmatched_children(existing, plans), [])
+
+    def test_extra_existing_child_is_reported(self):
+        sources = [_child(1, "P-2", "手順1")]
+        existing = [_child(9, "D-6", "手順1"), _child(8, "D-9", "現地対応メモ")]
+        plans = sut.build_child_plans(sources, existing, **self.OPTS)
+        unmatched = sut.find_unmatched_children(existing, plans)
+        self.assertEqual([c["issueKey"] for c in unmatched], ["D-9"])
+
+    def test_no_existing_children(self):
+        plans = sut.build_child_plans([_child(1, "P-2", "手順1")], [], **self.OPTS)
+        self.assertEqual(sut.find_unmatched_children([], plans), [])
+
+
 class TestResolveChildIssueType(unittest.TestCase):
     TYPES = [{"id": 1, "name": "タスク"}, {"id": 2, "name": "バグ"}]
 
@@ -815,6 +843,35 @@ class TestConfirm(unittest.TestCase):
             )
         self.assertIn("新規作成 2 件", captured["p"])
         self.assertIn("本文更新 1 件", captured["p"])
+
+    def _print_plan(self, child_plans, unmatched):
+        out = StringIO()
+        with patch("sys.stdout", out):
+            sut.print_plan(
+                sut.OUTCOME_NO_CHANGE, "親", {"issueKey": "D-5"}, child_plans, unmatched
+            )
+        return out.getvalue()
+
+    def test_warns_when_creating_and_unmatched_exists(self):
+        text = self._print_plan(
+            [self._plan(sut.OUTCOME_CREATED, "手順2 検証")],
+            [{"issueKey": "D-7", "summary": "検証手順"}],
+        )
+        self.assertIn("警告", text)
+        self.assertIn("D-7: 検証手順", text)
+        self.assertIn("重複", text)
+
+    def test_no_warning_when_nothing_is_created(self):
+        """作成が無ければ重複しないので、未照合があっても黙っている。"""
+        text = self._print_plan(
+            [self._plan(sut.OUTCOME_UPDATED, "手順1")],
+            [{"issueKey": "D-9", "summary": "現地対応メモ"}],
+        )
+        self.assertNotIn("警告", text)
+
+    def test_no_warning_when_nothing_unmatched(self):
+        text = self._print_plan([self._plan(sut.OUTCOME_CREATED, "手順2")], [])
+        self.assertNotIn("警告", text)
 
     def test_print_plan_lists_parent_and_children(self):
         out = StringIO()
@@ -1579,6 +1636,50 @@ class TestRunWithChildren(unittest.TestCase):
             outcome = sut.run(_make_args(execute=True, date="20260828"), _make_config())
         mc.update_issue.assert_called_once()
         self.assertEqual(outcome, sut.OUTCOME_NO_CHANGE)
+
+    def test_renamed_existing_child_is_warned_before_confirmation(self):
+        """複製先で件名が変わった子課題は照合できず、重複作成の警告が出る。"""
+        existing_children = [
+            _child(901, "PROJ-90", "手順1 バックアップ", "本文1"),
+            _child(902, "PROJ-91", "検証手順", "本文2"),  # 改名されている
+        ]
+        outcome, mc, out = self._run(
+            existing=EXISTING_SAME,
+            source_children=self.SOURCE_CHILDREN,
+            existing_children=existing_children,
+        )
+        self.assertEqual(outcome, sut.OUTCOME_CREATED)
+        self.assertIn("警告", out)
+        self.assertIn("PROJ-91: 検証手順", out)
+        # 動作自体は変わらず、重複した子課題が作られる
+        self.assertEqual(mc.create_issue.call_args[0][0]["summary"], "手順2 検証")
+
+    def test_cancel_after_warning_creates_nothing(self):
+        existing_children = [_child(902, "PROJ-91", "検証手順", "本文2")]
+        outcome, mc, out = self._run(
+            existing=EXISTING_SAME,
+            source_children=self.SOURCE_CHILDREN,
+            existing_children=existing_children,
+            answer="n",
+        )
+        self.assertIn("警告", out)
+        self.assertEqual(outcome, sut.OUTCOME_SKIPPED)
+        mc.create_issue.assert_not_called()
+
+    def test_extra_child_in_target_does_not_warn_without_creation(self):
+        """複製先に独自の子課題があっても、作成が無ければ警告しない。"""
+        existing_children = [
+            _child(901, "PROJ-90", "手順1 バックアップ", "本文1"),
+            _child(902, "PROJ-91", "手順2 検証", "本文2"),
+            _child(903, "PROJ-92", "現地対応メモ", "独自"),
+        ]
+        outcome, _, out = self._run(
+            existing=EXISTING_SAME,
+            source_children=self.SOURCE_CHILDREN,
+            existing_children=existing_children,
+        )
+        self.assertEqual(outcome, sut.OUTCOME_NO_CHANGE)
+        self.assertNotIn("警告", out)
 
     def test_cancel_skips_everything(self):
         outcome, mc, _ = self._run(source_children=self.SOURCE_CHILDREN, answer="n")
