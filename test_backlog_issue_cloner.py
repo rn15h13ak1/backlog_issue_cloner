@@ -213,6 +213,27 @@ class TestSearchIssuesPagination(unittest.TestCase):
             list(client.search_issues_by_keyword(10, "件名"))
         self.assertNotIn("statusId", mock_get.call_args[0][1])
 
+    def test_get_child_issues_filters_by_parent(self):
+        client = self._client()
+        children = [{"issueKey": "P-2", "summary": "子"}]
+        with patch.object(client, "_get", side_effect=[children]) as mock_get:
+            result = list(client.get_child_issues(1001))
+        self.assertEqual(result, children)
+        params = mock_get.call_args[0][1]
+        self.assertEqual(params["parentIssueId"], [1001])
+        # 完了済みの子課題を再作成しないよう状態では絞り込まない
+        self.assertNotIn("statusId", params)
+        self.assertNotIn("projectId", params)
+
+    def test_get_child_issues_paginates(self):
+        client = self._client()
+        pages = [self._page(100, "子"), [{"issueKey": "P-x", "summary": "子"}]]
+        with patch.object(client, "_get", side_effect=pages) as mock_get, \
+             patch("backlog_issue_cloner.time.sleep"):
+            result = list(client.get_child_issues(1001))
+        self.assertEqual(len(result), 101)
+        self.assertEqual(mock_get.call_args_list[1][0][1]["offset"], 100)
+
 
 # ===========================================================================
 # パラメータ展開テスト
@@ -508,35 +529,32 @@ class TestResolveIssueTypeId(unittest.TestCase):
         {"id": 3, "name": "要望"},
     ]
 
-    def _make_client(self):
-        client = MagicMock()
-        client.get_issue_types.return_value = self.TYPES
-        return client
-
     def test_exact_name_match(self):
-        client = self._make_client()
-        id_, name = sut.resolve_issue_type_id(client, "PROJ", "バグ")
+        id_, name = sut.resolve_issue_type_id(self.TYPES, "バグ")
         self.assertEqual(id_, 2)
         self.assertEqual(name, "バグ")
 
     def test_fallback_to_first_when_not_found(self):
-        client = self._make_client()
         with patch("sys.stderr", new_callable=StringIO):
-            id_, name = sut.resolve_issue_type_id(client, "PROJ", "存在しない種別")
+            id_, name = sut.resolve_issue_type_id(self.TYPES, "存在しない種別")
         self.assertEqual(id_, 1)
         self.assertEqual(name, "タスク")
 
     def test_none_returns_first(self):
-        client = self._make_client()
-        id_, name = sut.resolve_issue_type_id(client, "PROJ", None)
+        id_, name = sut.resolve_issue_type_id(self.TYPES, None)
         self.assertEqual(id_, 1)
         self.assertEqual(name, "タスク")
 
-    def test_empty_types_raises_config_error(self):
+    def test_fetch_raises_when_empty(self):
         client = MagicMock()
         client.get_issue_types.return_value = []
         with self.assertRaises(sut.ConfigError):
-            sut.resolve_issue_type_id(client, "PROJ", None)
+            sut.fetch_issue_types(client, "PROJ")
+
+    def test_fetch_returns_types(self):
+        client = MagicMock()
+        client.get_issue_types.return_value = self.TYPES
+        self.assertEqual(sut.fetch_issue_types(client, "PROJ"), self.TYPES)
 
 
 # ===========================================================================
@@ -551,28 +569,20 @@ class TestResolvePriorityId(unittest.TestCase):
         {"id": 4, "name": "低"},
     ]
 
-    def _make_client(self, priorities=None):
-        client = MagicMock()
-        client.get_priorities.return_value = priorities if priorities is not None else self.PRIORITIES
-        return client
-
     def test_exact_name_match(self):
-        client = self._make_client()
-        id_, name = sut.resolve_priority_id(client, "高")
+        id_, name = sut.resolve_priority_id(self.PRIORITIES, "高")
         self.assertEqual(id_, 2)
         self.assertEqual(name, "高")
 
     def test_fallback_to_chuu_when_none(self):
-        client = self._make_client()
-        id_, name = sut.resolve_priority_id(client, None)
+        id_, name = sut.resolve_priority_id(self.PRIORITIES, None)
         self.assertEqual(id_, 3)
         self.assertEqual(name, "中")
 
     def test_warns_and_falls_back_to_chuu_when_not_found(self):
         """指定した優先度が見つからない場合は警告して「中」を使う。"""
-        client = self._make_client()
         with patch("sys.stderr", new_callable=StringIO) as err:
-            id_, name = sut.resolve_priority_id(client, "存在しない優先度")
+            id_, name = sut.resolve_priority_id(self.PRIORITIES, "存在しない優先度")
         self.assertEqual(id_, 3)
         self.assertEqual(name, "中")
         message = err.getvalue()
@@ -581,23 +591,144 @@ class TestResolvePriorityId(unittest.TestCase):
 
     def test_falls_back_to_first_when_not_found_and_no_chuu(self):
         priorities = [{"id": 2, "name": "高"}, {"id": 4, "name": "低"}]
-        client = self._make_client(priorities)
         with patch("sys.stderr", new_callable=StringIO):
-            id_, name = sut.resolve_priority_id(client, "存在しない優先度")
+            id_, name = sut.resolve_priority_id(priorities, "存在しない優先度")
         self.assertEqual(id_, 2)
         self.assertEqual(name, "高")
 
     def test_fallback_to_first_when_chuu_not_found(self):
         priorities = [{"id": 2, "name": "高"}, {"id": 4, "name": "低"}]
-        client = self._make_client(priorities)
-        id_, name = sut.resolve_priority_id(client, None)
+        id_, name = sut.resolve_priority_id(priorities, None)
         self.assertEqual(id_, 2)
         self.assertEqual(name, "高")
 
-    def test_empty_priorities_raises_config_error(self):
-        client = self._make_client([])
+    def test_fetch_raises_when_empty(self):
+        client = MagicMock()
+        client.get_priorities.return_value = []
         with self.assertRaises(sut.ConfigError):
-            sut.resolve_priority_id(client, None)
+            sut.fetch_priorities(client)
+
+
+# ===========================================================================
+# 子課題の複製計画テスト
+# ===========================================================================
+
+
+class TestBuildChildSummary(unittest.TestCase):
+    def test_default_template_keeps_source_summary(self):
+        self.assertEqual(
+            sut.build_child_summary("{SOURCE_SUMMARY}", "手順1 バックアップ", "20260828"),
+            "手順1 バックアップ",
+        )
+
+    def test_date_placeholder(self):
+        self.assertEqual(
+            sut.build_child_summary("{YYYYMMDD} {SOURCE_SUMMARY}", "点検", "20260828"),
+            "20260828 点検",
+        )
+
+    def test_static_template(self):
+        self.assertEqual(sut.build_child_summary("固定", "元", "20260828"), "固定")
+
+
+class TestBuildChildPlans(unittest.TestCase):
+    OPTS = dict(template="{SOURCE_SUMMARY}", date_str="20260828", match_mode="substring")
+
+    def test_all_created_when_no_existing_children(self):
+        sources = [_child(1, "P-2", "子A"), _child(2, "P-3", "子B")]
+        plans = sut.build_child_plans(sources, [], **self.OPTS)
+        self.assertEqual([p.action for p in plans],
+                         [sut.OUTCOME_CREATED, sut.OUTCOME_CREATED])
+        self.assertEqual([p.summary for p in plans], ["子A", "子B"])
+        self.assertTrue(all(p.existing is None for p in plans))
+
+    def test_no_change_when_description_matches(self):
+        sources = [_child(1, "P-2", "子A", "同じ本文")]
+        existing = [_child(9, "Q-2", "子A", "同じ本文")]
+        plans = sut.build_child_plans(sources, existing, **self.OPTS)
+        self.assertEqual(plans[0].action, sut.OUTCOME_NO_CHANGE)
+        self.assertEqual(plans[0].existing["issueKey"], "Q-2")
+
+    def test_updated_when_description_differs(self):
+        sources = [_child(1, "P-2", "子A", "新しい本文")]
+        existing = [_child(9, "Q-2", "子A", "古い本文")]
+        plans = sut.build_child_plans(sources, existing, **self.OPTS)
+        self.assertEqual(plans[0].action, sut.OUTCOME_UPDATED)
+
+    def test_mixed(self):
+        sources = [
+            _child(1, "P-2", "子A", "同じ"),
+            _child(2, "P-3", "子B", "新"),
+            _child(3, "P-4", "子C", "本文"),
+        ]
+        existing = [_child(9, "Q-2", "子A", "同じ"), _child(8, "Q-3", "子B", "旧")]
+        plans = sut.build_child_plans(sources, existing, **self.OPTS)
+        self.assertEqual(
+            [p.action for p in plans],
+            [sut.OUTCOME_NO_CHANGE, sut.OUTCOME_UPDATED, sut.OUTCOME_CREATED],
+        )
+
+    def test_each_existing_child_matched_only_once(self):
+        """同名の子課題が複数あっても既存 1 件を重複して割り当てない。"""
+        sources = [_child(1, "P-2", "子A", "本文"), _child(2, "P-3", "子A", "本文")]
+        existing = [_child(9, "Q-2", "子A", "本文")]
+        plans = sut.build_child_plans(sources, existing, **self.OPTS)
+        self.assertEqual(plans[0].action, sut.OUTCOME_NO_CHANGE)
+        self.assertEqual(plans[1].action, sut.OUTCOME_CREATED)
+
+    def test_exact_match_mode(self):
+        sources = [_child(1, "P-2", "子A")]
+        existing = [_child(9, "Q-2", "子A（別）")]
+        plans = sut.build_child_plans(
+            sources, existing, **{**self.OPTS, "match_mode": "exact"}
+        )
+        self.assertEqual(plans[0].action, sut.OUTCOME_CREATED)
+
+    def test_empty_sources(self):
+        self.assertEqual(sut.build_child_plans([], [], **self.OPTS), [])
+
+
+class TestResolveChildIssueType(unittest.TestCase):
+    TYPES = [{"id": 1, "name": "タスク"}, {"id": 2, "name": "バグ"}]
+
+    def test_matches_by_name(self):
+        source = _child(1, "P-2", "子", type_name="バグ")
+        self.assertEqual(
+            sut.resolve_child_issue_type(self.TYPES, source, (1, "タスク")), (2, "バグ")
+        )
+
+    def test_falls_back_when_name_absent_in_target(self):
+        source = _child(1, "P-2", "子", type_name="複製先に無い種別")
+        self.assertEqual(
+            sut.resolve_child_issue_type(self.TYPES, source, (1, "タスク")), (1, "タスク")
+        )
+
+    def test_falls_back_when_no_issue_type(self):
+        self.assertEqual(
+            sut.resolve_child_issue_type(self.TYPES, {"summary": "子"}, (1, "タスク")),
+            (1, "タスク"),
+        )
+
+
+class TestAggregateOutcome(unittest.TestCase):
+    def test_skipped_wins(self):
+        actions = [sut.OUTCOME_CREATED, sut.OUTCOME_SKIPPED, sut.OUTCOME_UPDATED]
+        self.assertEqual(sut.aggregate_outcome(actions), sut.OUTCOME_SKIPPED)
+
+    def test_created_beats_updated(self):
+        actions = [sut.OUTCOME_NO_CHANGE, sut.OUTCOME_UPDATED, sut.OUTCOME_CREATED]
+        self.assertEqual(sut.aggregate_outcome(actions), sut.OUTCOME_CREATED)
+
+    def test_updated_beats_no_change(self):
+        self.assertEqual(
+            sut.aggregate_outcome([sut.OUTCOME_NO_CHANGE, sut.OUTCOME_UPDATED]),
+            sut.OUTCOME_UPDATED,
+        )
+
+    def test_all_no_change(self):
+        self.assertEqual(
+            sut.aggregate_outcome([sut.OUTCOME_NO_CHANGE]), sut.OUTCOME_NO_CHANGE
+        )
 
 
 # ===========================================================================
@@ -606,10 +737,15 @@ class TestResolvePriorityId(unittest.TestCase):
 
 
 class TestConfirm(unittest.TestCase):
+    def _plan(self, action, summary="子の件名"):
+        return sut.ChildPlan(source={}, summary=summary, action=action)
+
     def test_assume_yes_skips_input(self):
         with patch("sys.stdout", new_callable=StringIO), \
              patch("builtins.input", side_effect=AssertionError("input が呼ばれた")):
-            self.assertTrue(sut.confirm_create("件名", "PROJ-1", "本文", assume_yes=True))
+            self.assertTrue(
+                sut.confirm_plan(sut.OUTCOME_CREATED, [], assume_yes=True)
+            )
 
     def test_non_interactive_without_yes_returns_false(self):
         """非対話環境で --yes なしなら input を呼ばずに False。"""
@@ -617,24 +753,63 @@ class TestConfirm(unittest.TestCase):
              patch("sys.stderr", new_callable=StringIO) as err, \
              patch("sys.stdin.isatty", return_value=False), \
              patch("builtins.input", side_effect=AssertionError("input が呼ばれた")):
-            result = sut.confirm_create("件名", "PROJ-1", "本文")
+            result = sut.confirm_plan(sut.OUTCOME_CREATED, [])
         self.assertFalse(result)
         self.assertIn("--yes", err.getvalue())
 
     def test_interactive_yes(self):
         with patch("sys.stdout", new_callable=StringIO), tty(), \
              patch("builtins.input", return_value="y"):
-            self.assertTrue(sut.confirm_update("PROJ-1", "旧", "新"))
+            self.assertTrue(sut.confirm_plan(sut.OUTCOME_UPDATED, []))
 
     def test_interactive_no(self):
         with patch("sys.stdout", new_callable=StringIO), tty(), \
              patch("builtins.input", return_value="n"):
-            self.assertFalse(sut.confirm_update("PROJ-1", "旧", "新"))
+            self.assertFalse(sut.confirm_plan(sut.OUTCOME_UPDATED, []))
 
     def test_eof_treated_as_no(self):
         with patch("sys.stdout", new_callable=StringIO), tty(), \
              patch("builtins.input", side_effect=EOFError):
-            self.assertFalse(sut.confirm_update("PROJ-1", "旧", "新"))
+            self.assertFalse(sut.confirm_plan(sut.OUTCOME_UPDATED, []))
+
+    def test_no_confirmation_when_nothing_to_do(self):
+        """作成も更新も無い場合は確認せず True。"""
+        with patch("builtins.input", side_effect=AssertionError("input が呼ばれた")):
+            self.assertTrue(
+                sut.confirm_plan(
+                    sut.OUTCOME_NO_CHANGE, [self._plan(sut.OUTCOME_NO_CHANGE)]
+                )
+            )
+
+    def test_prompt_counts_parent_and_children(self):
+        captured = {}
+        with patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", side_effect=lambda p: captured.setdefault("p", p) and "y"):
+            sut.confirm_plan(
+                sut.OUTCOME_CREATED,
+                [
+                    self._plan(sut.OUTCOME_CREATED),
+                    self._plan(sut.OUTCOME_UPDATED),
+                    self._plan(sut.OUTCOME_NO_CHANGE),
+                ],
+            )
+        self.assertIn("新規作成 2 件", captured["p"])
+        self.assertIn("本文更新 1 件", captured["p"])
+
+    def test_print_plan_lists_parent_and_children(self):
+        out = StringIO()
+        with patch("sys.stdout", out):
+            sut.print_plan(
+                sut.OUTCOME_UPDATED,
+                "親の件名",
+                {"issueKey": "PROJ-99"},
+                [self._plan(sut.OUTCOME_CREATED, "子A")],
+            )
+        text = out.getvalue()
+        self.assertIn("[親]", text)
+        self.assertIn("PROJ-99", text)
+        self.assertIn("[子]", text)
+        self.assertIn("子A", text)
 
 
 # ===========================================================================
@@ -711,6 +886,7 @@ def _make_config(
 
 
 SOURCE_ISSUE = {
+    "id": 1001,
     "issueKey": "PROJ-1",
     "summary": "テンプレート課題",
     "description": "本文テキスト",
@@ -718,18 +894,29 @@ SOURCE_ISSUE = {
 }
 
 PROJECT = {"id": 10, "projectKey": "PROJ"}
-ISSUE_TYPES = [{"id": 1, "name": "タスク"}]
+ISSUE_TYPES = [{"id": 1, "name": "タスク"}, {"id": 2, "name": "バグ"}]
 PRIORITIES = [{"id": 2, "name": "高"}, {"id": 3, "name": "中"}]
 
 
-def _mock_client(existing_issue=None):
+def _child(id_, key, summary, description="子の本文", type_name="タスク", priority_id=3):
+    return {
+        "id": id_,
+        "issueKey": key,
+        "summary": summary,
+        "description": description,
+        "issueType": {"id": 1, "name": type_name},
+        "priority": {"id": priority_id, "name": "中"},
+    }
+
+
+def _mock_client(existing_issue=None, source_children=None, existing_children=None):
     mock_client = MagicMock()
     mock_client.get_issue.return_value = SOURCE_ISSUE
     mock_client.get_project.return_value = PROJECT
     mock_client.get_issue_types.return_value = ISSUE_TYPES
     mock_client.get_priorities.return_value = PRIORITIES
     mock_client.create_issue.return_value = {
-        "issueKey": "PROJ-100", "summary": "【定期】20260828 タスク"
+        "id": 2001, "issueKey": "PROJ-100", "summary": "【定期】20260828 タスク"
     }
     mock_client.update_issue.return_value = {
         "issueKey": "PROJ-99", "summary": "【定期】20260828 タスク"
@@ -737,15 +924,24 @@ def _mock_client(existing_issue=None):
     mock_client.search_issues_by_keyword.return_value = (
         [existing_issue] if existing_issue else []
     )
+    # コピー元の子課題 → 既存の親に紐づく子課題、の順で呼ばれる
+    mock_client.get_child_issues.side_effect = (
+        lambda parent_id: list(
+            source_children or [] if parent_id == SOURCE_ISSUE["id"]
+            else existing_children or []
+        )
+    )
     return patch("backlog_issue_cloner.BacklogClient", return_value=mock_client), mock_client
 
 
 EXISTING_SAME = {
+    "id": 1099,
     "issueKey": "PROJ-99",
     "summary": "【定期】20260828 タスク",
     "description": "本文テキスト",
 }
 EXISTING_DIFF = {
+    "id": 1099,
     "issueKey": "PROJ-99",
     "summary": "【定期】20260828 タスク",
     "description": "古い本文",
@@ -1158,6 +1354,31 @@ class TestValidateConfig(unittest.TestCase):
         with self.assertRaises(sut.ConfigError):
             sut.validate_config(cfg)
 
+    # --- 子課題の設定 ---
+
+    def test_string_for_include_children_raises(self):
+        cfg = self._base_config()
+        cfg["clone"]["include_children"] = "true"
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config(cfg)
+
+    def test_bool_for_include_children_passes(self):
+        for value in (True, False):
+            cfg = self._base_config()
+            cfg["clone"]["include_children"] = value
+            sut.validate_config(cfg)
+
+    def test_empty_child_summary_template_raises(self):
+        cfg = self._base_config()
+        cfg["clone"]["child_summary_template"] = ""
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config(cfg)
+
+    def test_child_summary_template_passes(self):
+        cfg = self._base_config()
+        cfg["clone"]["child_summary_template"] = "{YYYYMMDD} {SOURCE_SUMMARY}"
+        sut.validate_config(cfg)
+
 
 # ===========================================================================
 # 設定ファイルの読み込み・BacklogClient への受け渡し
@@ -1195,6 +1416,179 @@ class TestClientSettingsFromConfig(unittest.TestCase):
         self.assertEqual(kwargs["max_retries"], 0)
         self.assertEqual(kwargs["retry_backoff"], 0.25)
         self.assertEqual(kwargs["retry_max_delay"], 10.0)
+
+
+class TestRunWithChildren(unittest.TestCase):
+    """親課題と子課題をまとめて複製する経路を検証。"""
+
+    SOURCE_CHILDREN = [
+        _child(101, "PROJ-2", "手順1 バックアップ", "本文1"),
+        _child(102, "PROJ-3", "手順2 検証", "本文2", type_name="バグ"),
+    ]
+
+    def _run(self, *, existing=None, source_children=None, existing_children=None,
+             config=None, execute=True, answer="y"):
+        patcher, mc = _mock_client(
+            existing_issue=existing,
+            source_children=source_children,
+            existing_children=existing_children,
+        )
+        out = StringIO()
+        with patcher, patch("sys.stdout", out), patch("sys.stderr", new_callable=StringIO), \
+             tty(), patch("builtins.input", return_value=answer):
+            outcome = sut.run(
+                _make_args(execute=execute, date="20260828"), config or _make_config()
+            )
+        return outcome, mc, out.getvalue()
+
+    def test_creates_parent_and_children(self):
+        outcome, mc, _ = self._run(source_children=self.SOURCE_CHILDREN)
+        self.assertEqual(outcome, sut.OUTCOME_CREATED)
+        self.assertEqual(mc.create_issue.call_count, 3)  # 親 1 + 子 2
+
+        parent_params = mc.create_issue.call_args_list[0][0][0]
+        self.assertNotIn("parentIssueId", parent_params)
+        self.assertEqual(parent_params["summary"], "【定期】20260828 タスク")
+
+        child_params = [c[0][0] for c in mc.create_issue.call_args_list[1:]]
+        self.assertEqual([p["summary"] for p in child_params],
+                         ["手順1 バックアップ", "手順2 検証"])
+        # 親の作成レスポンスの id が子の parentIssueId になる
+        self.assertTrue(all(p["parentIssueId"] == 2001 for p in child_params))
+        self.assertEqual([p["description"] for p in child_params], ["本文1", "本文2"])
+
+    def test_child_inherits_issue_type_and_priority(self):
+        _, mc, _ = self._run(source_children=self.SOURCE_CHILDREN)
+        child_params = [c[0][0] for c in mc.create_issue.call_args_list[1:]]
+        # 「タスク」=1 /「バグ」=2 と、コピー元の子課題の種別に追随する
+        self.assertEqual([p["issueTypeId"] for p in child_params], [1, 2])
+        self.assertEqual([p["priorityId"] for p in child_params], [3, 3])
+
+    def test_unknown_child_type_falls_back_to_parent_type(self):
+        children = [_child(101, "PROJ-2", "子", type_name="複製先に無い種別")]
+        _, mc, _ = self._run(source_children=children)
+        child_params = mc.create_issue.call_args_list[1][0][0]
+        self.assertEqual(child_params["issueTypeId"], 1)  # 親と同じ「タスク」
+
+    def test_existing_parent_children_are_diffed(self):
+        """既存の親がある場合、その子課題と突き合わせて差分だけ反映する。"""
+        existing_children = [
+            _child(901, "PROJ-90", "手順1 バックアップ", "本文1"),   # 同一 → 変更なし
+            _child(902, "PROJ-91", "手順2 検証", "古い本文"),        # 差分 → 更新
+        ]
+        outcome, mc, _ = self._run(
+            existing=EXISTING_SAME,
+            source_children=self.SOURCE_CHILDREN,
+            existing_children=existing_children,
+        )
+        self.assertEqual(outcome, sut.OUTCOME_UPDATED)
+        mc.create_issue.assert_not_called()
+        mc.update_issue.assert_called_once_with("PROJ-91", {"description": "本文2"})
+
+    def test_missing_child_is_created_under_existing_parent(self):
+        existing_children = [_child(901, "PROJ-90", "手順1 バックアップ", "本文1")]
+        outcome, mc, _ = self._run(
+            existing=EXISTING_SAME,
+            source_children=self.SOURCE_CHILDREN,
+            existing_children=existing_children,
+        )
+        self.assertEqual(outcome, sut.OUTCOME_CREATED)
+        mc.create_issue.assert_called_once()
+        params = mc.create_issue.call_args[0][0]
+        self.assertEqual(params["summary"], "手順2 検証")
+        self.assertEqual(params["parentIssueId"], EXISTING_SAME["id"])
+
+    def test_all_identical_returns_no_change(self):
+        existing_children = [
+            _child(901, "PROJ-90", "手順1 バックアップ", "本文1"),
+            _child(902, "PROJ-91", "手順2 検証", "本文2"),
+        ]
+        outcome, mc, _ = self._run(
+            existing=EXISTING_SAME,
+            source_children=self.SOURCE_CHILDREN,
+            existing_children=existing_children,
+        )
+        self.assertEqual(outcome, sut.OUTCOME_NO_CHANGE)
+        mc.create_issue.assert_not_called()
+        mc.update_issue.assert_not_called()
+        mc.get_issue_types.assert_not_called()
+
+    def test_child_no_change_error_is_treated_as_no_change(self):
+        """子課題の更新で BacklogNoChangeError が出たら変更なし扱い。"""
+        existing_children = [_child(901, "PROJ-90", "手順1 バックアップ", "古い本文")]
+        patcher, mc = _mock_client(
+            existing_issue=EXISTING_SAME,
+            source_children=[self.SOURCE_CHILDREN[0]],
+            existing_children=existing_children,
+        )
+        mc.update_issue.side_effect = sut.BacklogNoChangeError("変更なし")
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            outcome = sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        mc.update_issue.assert_called_once()
+        self.assertEqual(outcome, sut.OUTCOME_NO_CHANGE)
+
+    def test_cancel_skips_everything(self):
+        outcome, mc, _ = self._run(source_children=self.SOURCE_CHILDREN, answer="n")
+        self.assertEqual(outcome, sut.OUTCOME_SKIPPED)
+        mc.create_issue.assert_not_called()
+        mc.update_issue.assert_not_called()
+
+    def test_single_confirmation_for_all_issues(self):
+        """子課題が何件あっても確認は 1 回だけ。"""
+        patcher, mc = _mock_client(source_children=self.SOURCE_CHILDREN)
+        calls = []
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", side_effect=lambda p: calls.append(p) or "y"):
+            sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        self.assertEqual(len(calls), 1)
+
+    def test_dry_run_creates_nothing(self):
+        outcome, mc, out = self._run(source_children=self.SOURCE_CHILDREN, execute=False)
+        self.assertEqual(outcome, sut.OUTCOME_CREATED)
+        mc.create_issue.assert_not_called()
+        self.assertIn("手順1 バックアップ", out)
+        self.assertIn("手順2 検証", out)
+
+    def test_child_summary_template(self):
+        cfg = _make_config()
+        cfg["clone"]["child_summary_template"] = "{YYYYMMDD} {SOURCE_SUMMARY}"
+        _, mc, _ = self._run(source_children=self.SOURCE_CHILDREN, config=cfg)
+        child_params = [c[0][0] for c in mc.create_issue.call_args_list[1:]]
+        self.assertEqual(
+            [p["summary"] for p in child_params],
+            ["20260828 手順1 バックアップ", "20260828 手順2 検証"],
+        )
+
+    # --- include_children ---
+
+    def test_include_children_false_skips_children(self):
+        cfg = _make_config()
+        cfg["clone"]["include_children"] = False
+        _, mc, _ = self._run(source_children=self.SOURCE_CHILDREN, config=cfg)
+        mc.get_child_issues.assert_not_called()
+        self.assertEqual(mc.create_issue.call_count, 1)  # 親のみ
+
+    def test_source_without_children_behaves_as_before(self):
+        outcome, mc, _ = self._run(source_children=[])
+        self.assertEqual(outcome, sut.OUTCOME_CREATED)
+        self.assertEqual(mc.create_issue.call_count, 1)
+
+    def test_child_source_issue_warns_and_skips_children(self):
+        """コピー元自身が子課題の場合は子を探さない（Backlog は 2 階層まで）。"""
+        patcher, mc = _mock_client()
+        mc.get_issue.return_value = {**SOURCE_ISSUE, "parentIssueId": 500}
+        err = StringIO()
+        with patcher, patch("sys.stdout", new_callable=StringIO), patch("sys.stderr", err), \
+             tty(), patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        mc.get_child_issues.assert_not_called()
+        self.assertIn("子課題のため", err.getvalue())
+
+    def test_no_child_lookup_on_existing_parent_when_source_has_no_children(self):
+        """コピー元に子が無ければ既存の親の子課題も引きに行かない。"""
+        _, mc, _ = self._run(existing=EXISTING_DIFF, source_children=[])
+        mc.get_child_issues.assert_called_once_with(SOURCE_ISSUE["id"])
 
 
 # ===========================================================================

@@ -2,6 +2,7 @@
 Backlog 課題クローンツール
 ==========================
 指定した課題の description をコピーして新規課題を作成する CLI ツール。
+親課題を指定した場合は、その子課題もまとめて複製する。
 
 使い方:
   python3 backlog_issue_cloner.py                    # ドライラン（デフォルト）
@@ -36,6 +37,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -378,35 +380,44 @@ class BacklogClient:
             allow_404=True,
         )
 
-    def search_issues_by_keyword(
-        self, project_id: int, keyword: str, status_ids: list | None = None
-    ):
+    def _iter_issues(self, params: dict):
         """
-        keyword でプロジェクト内の課題を遅延列挙する（ページネーション対応）。
+        /issues をページネーションしながら遅延列挙する。
         ジェネレータのため、呼び出し元が途中で打ち切れば以降のページは取得しない。
-        status_ids を渡すとその状態の課題のみに絞り込む。
-        Backlog の keyword 検索は summary + description を対象とするため、
-        呼び出し元で summary のフィルタを行うこと。
         """
         offset = 0
         count = 100
         while True:
-            params = {
-                "projectId": [project_id],
-                "keyword": keyword,
-                "count": count,
-                "offset": offset,
-            }
-            if status_ids:
-                params["statusId"] = list(status_ids)
-            issues = self._get("/issues", params)
-            if not issues:
+            page = self._get("/issues", {**params, "count": count, "offset": offset})
+            if not page:
                 return
-            yield from issues
-            if len(issues) < count:
+            yield from page
+            if len(page) < count:
                 return
             offset += count
             time.sleep(0.3)
+
+    def search_issues_by_keyword(
+        self, project_id: int, keyword: str, status_ids: list | None = None
+    ):
+        """
+        keyword でプロジェクト内の課題を遅延列挙する。
+        status_ids を渡すとその状態の課題のみに絞り込む。
+        Backlog の keyword 検索は summary + description を対象とするため、
+        呼び出し元で summary のフィルタを行うこと。
+        """
+        params = {"projectId": [project_id], "keyword": keyword}
+        if status_ids:
+            params["statusId"] = list(status_ids)
+        return self._iter_issues(params)
+
+    def get_child_issues(self, parent_issue_id: int):
+        """
+        親課題に紐づく子課題を遅延列挙する。
+        親課題で絞り込むため状態によるフィルタは行わない
+        （完了済みの子課題を再作成してしまうのを避けるため）。
+        """
+        return self._iter_issues({"parentIssueId": [parent_issue_id]})
 
     # ------------------------------------------------------------------
     # 課題の作成・更新
@@ -497,10 +508,17 @@ def validate_config(config: dict) -> None:
                 f"指定してください: {val!r}"
             )
 
+    if "child_summary_template" in c and not c["child_summary_template"]:
+        raise ConfigError(
+            "config.yaml の clone.child_summary_template を空にはできません。"
+            "（省略時は {SOURCE_SUMMARY}、つまりコピー元の子課題の件名をそのまま使います）"
+        )
+
     # 真偽値設定: "false" のような文字列を真と誤解しないよう型を確認する
     for section_name, section, key in (
         ("backlog", b, "ssl_verify"),
         ("clone", c, "include_closed"),
+        ("clone", c, "include_children"),
     ):
         if key in section and not isinstance(section[key], bool):
             raise ConfigError(
@@ -527,13 +545,24 @@ def resolve_date(date_arg: str | None) -> str:
     return datetime.now().strftime("%Y%m%d")
 
 
-def resolve_issue_type_id(
-    client: BacklogClient, project_key: str, name: str | None
-) -> tuple[int, str]:
-    """種別IDと種別名を返す。見つからない場合は警告して最初の種別にフォールバック。"""
+def fetch_issue_types(client: BacklogClient, project_key: str) -> list:
+    """プロジェクトの種別一覧を取得する。空なら ConfigError。"""
     types = client.get_issue_types(project_key)
     if not types:
         raise ConfigError(f"プロジェクト {project_key} の種別が取得できませんでした。")
+    return types
+
+
+def fetch_priorities(client: BacklogClient) -> list:
+    """優先度一覧を取得する。空なら ConfigError。"""
+    priorities = client.get_priorities()
+    if not priorities:
+        raise ConfigError("優先度一覧が取得できませんでした。")
+    return priorities
+
+
+def resolve_issue_type_id(types: list, name: str | None) -> tuple[int, str]:
+    """種別IDと種別名を返す。見つからない場合は警告して最初の種別にフォールバック。"""
     if name:
         matched = [t for t in types if t["name"] == name]
         if matched:
@@ -547,13 +576,8 @@ def resolve_issue_type_id(
     return types[0]["id"], types[0]["name"]
 
 
-def resolve_priority_id(
-    client: BacklogClient, name: str | None
-) -> tuple[int, str]:
+def resolve_priority_id(priorities: list, name: str | None) -> tuple[int, str]:
     """優先度IDと優先度名を返す。見つからない場合は「中」→ 最初の優先度にフォールバック。"""
-    priorities = client.get_priorities()
-    if not priorities:
-        raise ConfigError("優先度一覧が取得できませんでした。")
     if name:
         matched = [p for p in priorities if p["name"] == name]
         if matched:
@@ -586,13 +610,102 @@ def find_existing_by_summary(
     検索結果は遅延列挙されるため、最初にマッチした時点で以降のページは取得しない。
     """
     for issue in client.search_issues_by_keyword(project_id, summary, status_ids):
-        candidate = issue.get("summary", "")
-        if match_mode == "exact":
-            if candidate == summary:
-                return issue
-        elif summary in candidate:
+        if summary_matches(summary, issue.get("summary", ""), match_mode):
             return issue
     return None
+
+
+def summary_matches(wanted: str, candidate: str, match_mode: str) -> bool:
+    """件名が一致するか。match_mode="exact" なら完全一致、"substring" なら部分一致。"""
+    if match_mode == "exact":
+        return candidate == wanted
+    return wanted in candidate
+
+
+# ===========================================================================
+# 子課題の複製計画
+# ===========================================================================
+
+
+@dataclass
+class ChildPlan:
+    """1 件の子課題に対して行う操作。"""
+
+    source: dict            # コピー元の子課題
+    summary: str            # 作成・照合に使う件名
+    action: str             # OUTCOME_CREATED / OUTCOME_UPDATED / OUTCOME_NO_CHANGE
+    existing: dict | None = None  # 複製先に既にある子課題
+
+
+def build_child_summary(template: str, source_summary: str, date_str: str) -> str:
+    """子課題の件名を組み立てる。"""
+    return template.replace("{SOURCE_SUMMARY}", source_summary).replace(
+        "{YYYYMMDD}", date_str
+    )
+
+
+def build_child_plans(
+    source_children: list,
+    existing_children: list,
+    *,
+    template: str,
+    date_str: str,
+    match_mode: str,
+) -> list[ChildPlan]:
+    """
+    コピー元の子課題と複製先の既存子課題を突き合わせ、各子課題の操作を決める。
+    照合は複製先の親課題に紐づく子課題の中だけで行うため、
+    プロジェクト全体のキーワード検索は不要。
+    """
+    plans = []
+    used = set()
+    for source in source_children:
+        summary = build_child_summary(template, source.get("summary", ""), date_str)
+        match = None
+        for i, existing in enumerate(existing_children):
+            if i in used:
+                continue
+            if summary_matches(summary, existing.get("summary", ""), match_mode):
+                match = (i, existing)
+                break
+        if match is None:
+            plans.append(ChildPlan(source=source, summary=summary, action=OUTCOME_CREATED))
+            continue
+        index, existing = match
+        used.add(index)
+        same = (existing.get("description") or "") == (source.get("description") or "")
+        plans.append(
+            ChildPlan(
+                source=source,
+                summary=summary,
+                action=OUTCOME_NO_CHANGE if same else OUTCOME_UPDATED,
+                existing=existing,
+            )
+        )
+    return plans
+
+
+def resolve_child_issue_type(
+    issue_types: list, source_child: dict, fallback: tuple[int, str]
+) -> tuple[int, str]:
+    """
+    子課題の種別を複製先プロジェクトで解決する。
+    コピー元と同名の種別があればそれを使い、無ければ親と同じ種別にフォールバックする。
+    """
+    name = (source_child.get("issueType") or {}).get("name")
+    if name:
+        for t in issue_types:
+            if t["name"] == name:
+                return t["id"], t["name"]
+    return fallback
+
+
+def aggregate_outcome(actions: list[str]) -> str:
+    """親と子の操作をまとめて 1 つの実行結果にする。"""
+    for outcome in (OUTCOME_SKIPPED, OUTCOME_CREATED, OUTCOME_UPDATED):
+        if outcome in actions:
+            return outcome
+    return OUTCOME_NO_CHANGE
 
 
 # ===========================================================================
@@ -619,25 +732,45 @@ def _ask(prompt: str, assume_yes: bool) -> bool:
     return answer in ("y", "yes")
 
 
-def confirm_create(
-    summary: str, source_key: str, description_preview: str, assume_yes: bool = False
-) -> bool:
-    print("\n新規作成の確認:")
-    print(f"  件名      : {summary}")
-    print(f"  コピー元  : {source_key}")
-    preview = description_preview[:200]
-    if preview:
-        print(f"  本文冒頭  : {preview!r}")
-    return _ask("  Backlog に新規作成しますか？ [y/N]: ", assume_yes)
+ACTION_LABELS = {
+    OUTCOME_CREATED: "新規作成",
+    OUTCOME_UPDATED: "本文を更新",
+    OUTCOME_NO_CHANGE: "変更なし",
+}
 
 
-def confirm_update(
-    existing_key: str, existing_desc: str, source_desc: str, assume_yes: bool = False
+def print_plan(
+    parent_action: str,
+    parent_summary: str,
+    parent_existing: dict | None,
+    child_plans: list[ChildPlan],
+) -> None:
+    """これから行う操作の一覧を表示する。"""
+    print("\n実行内容:")
+    where = f"（{parent_existing['issueKey']}）" if parent_existing else ""
+    print(f"  [親] {ACTION_LABELS[parent_action]:8} {parent_summary}{where}")
+    for plan in child_plans:
+        where = f"（{plan.existing['issueKey']}）" if plan.existing else ""
+        print(f"  [子] {ACTION_LABELS[plan.action]:8} {plan.summary}{where}")
+
+
+def confirm_plan(
+    parent_action: str, child_plans: list[ChildPlan], assume_yes: bool = False
 ) -> bool:
-    print(f"\n本文更新の確認 ({existing_key}):")
-    print(f"  既存の本文（冒頭）: {existing_desc[:120]!r}")
-    print(f"  新しい本文（冒頭）: {source_desc[:120]!r}")
-    return _ask("  既存課題の本文を更新しますか？ [y/N]: ", assume_yes)
+    """作成・更新が 1 件でもあれば確認を取る。何もしない場合は確認しない。"""
+    actions = [parent_action] + [p.action for p in child_plans]
+    creates = actions.count(OUTCOME_CREATED)
+    updates = actions.count(OUTCOME_UPDATED)
+    if not creates and not updates:
+        return True
+    parts = []
+    if creates:
+        parts.append(f"新規作成 {creates} 件")
+    if updates:
+        parts.append(f"本文更新 {updates} 件")
+    return _ask(
+        f"  Backlog に反映しますか？（{' / '.join(parts)}） [y/N]: ", assume_yes
+    )
 
 
 # ===========================================================================
@@ -676,6 +809,21 @@ def run(args: argparse.Namespace, config: dict) -> str:
     if source_issue is None:
         raise ConfigError(f"コピー元課題「{source_key}」が見つかりません。")
     source_desc = source_issue.get("description") or ""
+
+    # 3b. コピー元の子課題を取得
+    include_children = bool(clone_cfg.get("include_children", True))
+    source_children = []
+    if include_children:
+        if source_issue.get("parentIssueId"):
+            # Backlog の親子関係は 2 階層までで、子課題は子を持てない
+            print(
+                f"警告: {source_key} は子課題のため、子課題の複製は行いません。",
+                file=sys.stderr,
+            )
+        else:
+            print("コピー元の子課題を取得中...")
+            source_children = list(client.get_child_issues(source_issue["id"]))
+            print(f"  子課題: {len(source_children)} 件")
 
     # 4. 対象プロジェクトのキーと ID を確定
     # Backlog API の単一課題レスポンスには projectId（数値）のみ含まれ project オブジェクトはない。
@@ -716,66 +864,134 @@ def run(args: argparse.Namespace, config: dict) -> str:
         client, project_id, summary, match_mode=match_mode, status_ids=status_ids
     )
 
-    if existing:
-        existing_key = existing["issueKey"]
-        existing_desc = existing.get("description") or ""
+    # 8. 親課題の操作を決める
+    if existing is None:
+        parent_action = OUTCOME_CREATED
+        existing_children = []
+    else:
+        print(f"既存課題あり: {existing['issueKey']}")
+        same = (existing.get("description") or "") == source_desc
+        parent_action = OUTCOME_NO_CHANGE if same else OUTCOME_UPDATED
+        # 既存の親に紐づく子課題を照合対象にする
+        existing_children = (
+            list(client.get_child_issues(existing["id"])) if source_children else []
+        )
 
-        if existing_desc == source_desc:
-            # 8a. description も同じ → 何もしない
-            print(f"既存課題あり、変更なし: {existing_key}")
-            return OUTCOME_NO_CHANGE
-
-        # 8b. description に差分あり → 更新フロー
-        print(f"既存課題あり、本文に差分あり: {existing_key}")
-        if dry_run:
-            print(f"[DRY RUN] 本文を更新します: {existing_key}")
-            print(f"  既存本文（冒頭）: {existing_desc[:120]!r}")
-            print(f"  新規本文（冒頭）: {source_desc[:120]!r}")
-            return OUTCOME_UPDATED
-
-        if not confirm_update(existing_key, existing_desc, source_desc, assume_yes):
-            print(f"スキップ（更新をキャンセル）: {existing_key}")
-            return OUTCOME_SKIPPED
-
-        try:
-            updated = client.update_issue(existing_key, {"description": source_desc})
-        except BacklogNoChangeError:
-            print(f"スキップ（変更なし）: {existing_key}")
-            return OUTCOME_NO_CHANGE
-        print(f"更新完了: {updated['issueKey']} — {updated['summary']}")
-        return OUTCOME_UPDATED
-
-    # 8. 既存課題なし → 新規作成フロー
-    # ここで初めて種別・優先度を解決する（作成時にしか使わないため）
-    issue_type_id, issue_type_name = resolve_issue_type_id(
-        client, target_project_key, clone_cfg.get("issue_type")
+    # 9. 子課題の操作を決める
+    child_plans = build_child_plans(
+        source_children,
+        existing_children,
+        template=clone_cfg.get("child_summary_template", "{SOURCE_SUMMARY}"),
+        date_str=date_str,
+        match_mode=match_mode,
     )
-    priority_id, priority_name = resolve_priority_id(
-        client, clone_cfg.get("priority")
-    )
-    print(f"  種別        : {issue_type_name} (id={issue_type_id})")
-    print(f"  優先度      : {priority_name} (id={priority_id})")
+
+    print_plan(parent_action, summary, existing, child_plans)
+
+    all_actions = [parent_action] + [p.action for p in child_plans]
+    if OUTCOME_CREATED not in all_actions and OUTCOME_UPDATED not in all_actions:
+        print("\n変更はありません。")
+        return OUTCOME_NO_CHANGE
+
+    # 10. 作成があるときだけ種別・優先度を解決する
+    issue_types = priorities = None
+    issue_type_id = priority_id = None
+    if OUTCOME_CREATED in all_actions:
+        issue_types = fetch_issue_types(client, target_project_key)
+        priorities = fetch_priorities(client)
+        issue_type_id, issue_type_name = resolve_issue_type_id(
+            issue_types, clone_cfg.get("issue_type")
+        )
+        priority_id, priority_name = resolve_priority_id(
+            priorities, clone_cfg.get("priority")
+        )
+        print(f"  種別（親）  : {issue_type_name} (id={issue_type_id})")
+        print(f"  優先度（親）: {priority_name} (id={priority_id})")
 
     if dry_run:
-        print("[DRY RUN] 新規課題を作成します:")
-        print(f"  件名: {summary}")
-        if source_desc:
-            print(f"  本文（冒頭）: {source_desc[:200]!r}")
-        return OUTCOME_CREATED
+        return aggregate_outcome(all_actions)
 
-    if not confirm_create(summary, source_key, source_desc, assume_yes):
-        print("スキップ（作成をキャンセル）")
+    # 11. 確認
+    if not confirm_plan(parent_action, child_plans, assume_yes):
+        print("スキップ（キャンセル）")
         return OUTCOME_SKIPPED
 
-    params = {
+    # 12. 親課題を作成・更新して、子課題を紐づける親の ID を確定する
+    if parent_action == OUTCOME_CREATED:
+        created = client.create_issue({
+            "projectId": project_id,
+            "summary": summary,
+            "issueTypeId": issue_type_id,
+            "priorityId": priority_id,
+            "description": source_desc,
+        })
+        parent_id = created["id"]
+        print(f"作成完了: {created['issueKey']} — {created['summary']}")
+    else:
+        parent_id = existing["id"]
+        if parent_action == OUTCOME_UPDATED:
+            try:
+                updated = client.update_issue(
+                    existing["issueKey"], {"description": source_desc}
+                )
+                print(f"更新完了: {updated['issueKey']} — {updated['summary']}")
+            except BacklogNoChangeError:
+                print(f"スキップ（変更なし）: {existing['issueKey']}")
+                parent_action = OUTCOME_NO_CHANGE
+
+    # 13. 子課題を作成・更新する
+    done_actions = [parent_action]
+    for plan in child_plans:
+        done_actions.append(
+            _apply_child_plan(
+                client, plan, parent_id, project_id, issue_types,
+                (issue_type_id, priority_id),
+            )
+        )
+
+    return aggregate_outcome(done_actions)
+
+
+def _apply_child_plan(
+    client: BacklogClient,
+    plan: ChildPlan,
+    parent_id: int,
+    project_id: int,
+    issue_types: list | None,
+    parent_defaults: tuple,
+) -> str:
+    """1 件の子課題に対して計画した操作を実行し、実際の結果を返す。"""
+    if plan.action == OUTCOME_NO_CHANGE:
+        return OUTCOME_NO_CHANGE
+
+    source_desc = plan.source.get("description") or ""
+
+    if plan.action == OUTCOME_UPDATED:
+        try:
+            updated = client.update_issue(
+                plan.existing["issueKey"], {"description": source_desc}
+            )
+        except BacklogNoChangeError:
+            print(f"  [子] スキップ（変更なし）: {plan.existing['issueKey']}")
+            return OUTCOME_NO_CHANGE
+        print(f"  [子] 更新完了: {updated['issueKey']} — {updated['summary']}")
+        return OUTCOME_UPDATED
+
+    # 種別はコピー元の子課題に合わせ、優先度は Backlog 共通のため ID をそのまま使う
+    fallback_type_id, fallback_priority_id = parent_defaults
+    type_id, _ = resolve_child_issue_type(
+        issue_types or [], plan.source, (fallback_type_id, "")
+    )
+    priority_id = (plan.source.get("priority") or {}).get("id") or fallback_priority_id
+    created = client.create_issue({
         "projectId": project_id,
-        "summary": summary,
-        "issueTypeId": issue_type_id,
+        "summary": plan.summary,
+        "issueTypeId": type_id,
         "priorityId": priority_id,
         "description": source_desc,
-    }
-    created = client.create_issue(params)
-    print(f"作成完了: {created['issueKey']} — {created['summary']}")
+        "parentIssueId": parent_id,
+    })
+    print(f"  [子] 作成完了: {created['issueKey']} — {created['summary']}")
     return OUTCOME_CREATED
 
 
