@@ -474,6 +474,44 @@ def _require_section(config: dict, name: str) -> dict:
     return section
 
 
+def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
+    """
+    コマンドライン引数で設定ファイルの clone セクションを上書きする。
+    設定ファイルには接続情報だけ置き、複製の対象は実行時に指定する使い方を可能にする。
+    """
+    if not isinstance(config, dict):
+        return config  # 空ファイルなどは validate_config に任せる
+
+    overrides = {
+        "source_issue_key": getattr(args, "source_issue_key", None),
+        "target_issue_key": getattr(args, "target_issue_key", None),
+        "summary_template": getattr(args, "summary_template", None),
+    }
+    drop_template = bool(getattr(args, "no_summary_template", False))
+    if not any(overrides.values()) and not drop_template:
+        return config
+
+    section = config.get("clone")
+    clone = dict(section) if isinstance(section, dict) else {}
+    for key, value in overrides.items():
+        if value:
+            clone[key] = value
+    if drop_template:
+        clone.pop("summary_template", None)
+
+    # target_issue_key を指定した実行では複製先がその課題に決まるため、
+    # 設定ファイル側の target_project_key は意味を持たない。
+    # 残すと「同時に指定できません」で弾かれるので取り下げる。
+    if overrides["target_issue_key"] and clone.pop("target_project_key", None):
+        print(
+            "警告: --target-issue-key を指定したため、"
+            "設定ファイルの clone.target_project_key は無視します。",
+            file=sys.stderr,
+        )
+
+    return {**config, "clone": clone}
+
+
 def validate_config(config: dict) -> None:
     # yaml.safe_load は空ファイルに対して None を返すため最初に弾く
     if not isinstance(config, dict):
@@ -491,10 +529,24 @@ def validate_config(config: dict) -> None:
         if not val or val == placeholder:
             raise ConfigError(f"config.yaml の backlog.{key} を設定してください。")
 
-    c = _require_section(config, "clone")
-    src = c.get("source_issue_key", "")
-    if not src or src == "PROJ-123":
-        raise ConfigError("config.yaml の clone.source_issue_key を設定してください。")
+    c = config.get("clone")
+    if c is None:
+        raise ConfigError(
+            "コピー元の課題が指定されていません。config.yaml の clone.source_issue_key に"
+            "設定するか、--source-issue-key で指定してください"
+            "（対話形式で選ぶ場合は menu.py を使ってください）。"
+        )
+    if not isinstance(c, dict):
+        raise ConfigError("config.yaml の clone: セクションの形式が不正です（マッピングが必要です）。")
+
+    # source_issue_key はサンプル値（PROJ-123）かどうかを見ない。
+    # --source-issue-key や menu.py から実在のキーとして渡されることがあり、
+    # 未編集のまま実行した場合も「コピー元課題が見つかりません」で十分に伝わるため。
+    if not c.get("source_issue_key"):
+        raise ConfigError(
+            "コピー元の課題が指定されていません。config.yaml の clone.source_issue_key に"
+            "設定するか、--source-issue-key で指定してください。"
+        )
     # summary_template は省略可（省略時はコピー元の件名をそのまま使う）。
     # ただし空文字を指定した場合は件名が空になってしまうため弾く。
     if "summary_template" in c and not c["summary_template"]:
@@ -1181,6 +1233,33 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="API リクエストの詳細を表示する",
     )
+
+    override = parser.add_argument_group(
+        "設定の上書き",
+        "設定ファイルの clone セクションを実行時に上書きする"
+        "（設定ファイルには接続情報だけ置く運用向け）",
+    )
+    override.add_argument(
+        "--source-issue-key",
+        metavar="KEY",
+        help="コピー元の課題キー（例: PROJ-123）",
+    )
+    override.add_argument(
+        "--target-issue-key",
+        metavar="KEY",
+        help="複製先の課題キー。指定すると件名で検索せずこの課題を直接更新する",
+    )
+    template = override.add_mutually_exclusive_group()
+    template.add_argument(
+        "--summary-template",
+        metavar="TEMPLATE",
+        help="件名テンプレート（{SOURCE_SUMMARY} / {YYYYMMDD} が使える）",
+    )
+    template.add_argument(
+        "--no-summary-template",
+        action="store_true",
+        help="設定ファイルの件名テンプレートを無視し、重複チェックせず毎回新規作成する",
+    )
     return parser
 
 
@@ -1189,6 +1268,7 @@ def main() -> None:
 
     try:
         config = load_config(args.config)
+        config = apply_cli_overrides(config, args)
         validate_config(config)
 
         dry_run = not args.execute

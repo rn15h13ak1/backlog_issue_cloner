@@ -1327,11 +1327,18 @@ class TestValidateConfig(unittest.TestCase):
         with self.assertRaises(sut.ConfigError):
             sut.validate_config(cfg)
 
-    def test_placeholder_source_issue_key_raises(self):
+    def test_sample_looking_source_issue_key_is_accepted(self):
+        """PROJ-123 は実在しうるキーなので、サンプル値として弾かない。"""
         cfg = self._base_config()
         cfg["clone"]["source_issue_key"] = "PROJ-123"
-        with self.assertRaises(sut.ConfigError):
+        sut.validate_config(cfg)
+
+    def test_empty_source_issue_key_raises(self):
+        cfg = self._base_config()
+        cfg["clone"]["source_issue_key"] = ""
+        with self.assertRaises(sut.ConfigError) as ctx:
             sut.validate_config(cfg)
+        self.assertIn("--source-issue-key", str(ctx.exception))
 
     def test_empty_summary_template_raises(self):
         cfg = self._base_config()
@@ -1994,6 +2001,97 @@ class TestLoadConfig(unittest.TestCase):
 
 
 # ===========================================================================
+# apply_cli_overrides テスト
+# ===========================================================================
+
+
+class TestApplyCliOverrides(unittest.TestCase):
+    """設定ファイルの clone セクションをコマンドライン引数で上書きする。"""
+
+    def _args(self, **kw):
+        args = MagicMock()
+        args.source_issue_key = kw.get("source_issue_key")
+        args.target_issue_key = kw.get("target_issue_key")
+        args.summary_template = kw.get("summary_template")
+        args.no_summary_template = kw.get("no_summary_template", False)
+        return args
+
+    def _config(self, **clone):
+        return {"backlog": {"space_host": "t.backlog.com", "api_key": "K"},
+                "clone": dict(clone)}
+
+    def test_no_overrides_returns_config_unchanged(self):
+        cfg = self._config(source_issue_key="PROJ-1")
+        self.assertIs(sut.apply_cli_overrides(cfg, self._args()), cfg)
+
+    def test_source_issue_key_override(self):
+        cfg = self._config(source_issue_key="PROJ-1")
+        out = sut.apply_cli_overrides(cfg, self._args(source_issue_key="PROJ-9"))
+        self.assertEqual(out["clone"]["source_issue_key"], "PROJ-9")
+        # 元の dict は変更しない
+        self.assertEqual(cfg["clone"]["source_issue_key"], "PROJ-1")
+
+    def test_creates_clone_section_when_absent(self):
+        """接続情報だけの設定ファイルでも指定できる。"""
+        cfg = {"backlog": {"space_host": "t.backlog.com", "api_key": "K"}}
+        out = sut.apply_cli_overrides(cfg, self._args(source_issue_key="PROJ-9"))
+        self.assertEqual(out["clone"], {"source_issue_key": "PROJ-9"})
+        sut.validate_config(out)  # 例外が出なければ OK
+
+    def test_null_clone_section_is_replaced(self):
+        cfg = {"backlog": {"space_host": "t.backlog.com", "api_key": "K"}, "clone": None}
+        out = sut.apply_cli_overrides(cfg, self._args(source_issue_key="PROJ-9"))
+        self.assertEqual(out["clone"], {"source_issue_key": "PROJ-9"})
+
+    def test_summary_template_override(self):
+        cfg = self._config(source_issue_key="PROJ-1", summary_template="旧")
+        out = sut.apply_cli_overrides(cfg, self._args(summary_template="新{YYYYMMDD}"))
+        self.assertEqual(out["clone"]["summary_template"], "新{YYYYMMDD}")
+
+    def test_no_summary_template_drops_it(self):
+        """設定ファイルの件名テンプレートを無視して単純複製にする。"""
+        cfg = self._config(source_issue_key="PROJ-1", summary_template="【定期】{YYYYMMDD}")
+        out = sut.apply_cli_overrides(cfg, self._args(no_summary_template=True))
+        self.assertNotIn("summary_template", out["clone"])
+
+    def test_no_summary_template_without_config_value(self):
+        cfg = self._config(source_issue_key="PROJ-1")
+        out = sut.apply_cli_overrides(cfg, self._args(no_summary_template=True))
+        self.assertNotIn("summary_template", out["clone"])
+
+    def test_target_issue_key_override(self):
+        cfg = self._config(source_issue_key="PROJ-1")
+        out = sut.apply_cli_overrides(cfg, self._args(target_issue_key="DEST-5"))
+        self.assertEqual(out["clone"]["target_issue_key"], "DEST-5")
+
+    def test_target_issue_key_drops_conflicting_project_key(self):
+        """両方あると validate_config で弾かれるため、設定ファイル側を取り下げる。"""
+        cfg = self._config(source_issue_key="PROJ-1", target_project_key="OTHER")
+        with patch("sys.stderr", new_callable=StringIO) as err:
+            out = sut.apply_cli_overrides(cfg, self._args(target_issue_key="DEST-5"))
+        self.assertNotIn("target_project_key", out["clone"])
+        self.assertIn("target_project_key", err.getvalue())
+        sut.validate_config(out)
+
+    def test_target_project_key_kept_without_target_issue_key(self):
+        cfg = self._config(source_issue_key="PROJ-1", target_project_key="OTHER")
+        out = sut.apply_cli_overrides(cfg, self._args(source_issue_key="PROJ-9"))
+        self.assertEqual(out["clone"]["target_project_key"], "OTHER")
+
+    def test_none_config_passes_through(self):
+        """空ファイルは validate_config 側で弾く。"""
+        self.assertIsNone(
+            sut.apply_cli_overrides(None, self._args(source_issue_key="PROJ-9"))
+        )
+
+    def test_missing_source_key_message_mentions_cli_option(self):
+        cfg = {"backlog": {"space_host": "t.backlog.com", "api_key": "K"}}
+        with self.assertRaises(sut.ConfigError) as ctx:
+            sut.validate_config(cfg)
+        self.assertIn("--source-issue-key", str(ctx.exception))
+
+
+# ===========================================================================
 # build_parser テスト
 # ===========================================================================
 
@@ -2025,6 +2123,29 @@ class TestBuildParser(unittest.TestCase):
         args = self.parse(["--config", "my.yaml", "--date", "20260401"])
         self.assertEqual(args.config, "my.yaml")
         self.assertEqual(args.date, "20260401")
+
+    def test_override_options(self):
+        args = self.parse([
+            "--source-issue-key", "PROJ-1",
+            "--target-issue-key", "DEST-5",
+            "--summary-template", "【定期】{YYYYMMDD}",
+        ])
+        self.assertEqual(args.source_issue_key, "PROJ-1")
+        self.assertEqual(args.target_issue_key, "DEST-5")
+        self.assertEqual(args.summary_template, "【定期】{YYYYMMDD}")
+        self.assertFalse(args.no_summary_template)
+
+    def test_override_defaults_are_none(self):
+        args = self.parse([])
+        self.assertIsNone(args.source_issue_key)
+        self.assertIsNone(args.target_issue_key)
+        self.assertIsNone(args.summary_template)
+        self.assertFalse(args.no_summary_template)
+
+    def test_summary_template_options_are_mutually_exclusive(self):
+        with patch("sys.stderr", new_callable=StringIO):
+            with self.assertRaises(SystemExit):
+                self.parse(["--summary-template", "x", "--no-summary-template"])
 
     def test_unknown_option_exits(self):
         with patch("sys.stderr", new_callable=StringIO):

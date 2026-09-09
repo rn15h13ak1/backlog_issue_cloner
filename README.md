@@ -65,6 +65,59 @@ cp config.sample.yaml config.yaml
 これだけで**単純複製**モードとして動きます。定期実行したい場合は `clone.summary_template` に
 `{YYYYMMDD}` を含む件名を設定してください（[3 つの動作モード](#3-つの動作モード)を参照）。
 
+## 対話メニュー
+
+`menu.py` を使うと、3 つのモードを選んで課題キーをその場で入力できます。
+**設定ファイルには接続情報だけあればよく**、複製の対象は実行のたびに指定します。
+
+```bash
+python3 menu.py
+```
+
+```
+============================================================
+  Backlog 課題クローン
+============================================================
+  接続先: myteam.backlog.com
+
+============================================================
+  モードを選択
+============================================================
+  1. 単純複製 — 課題を子課題ごとそのままコピーする（毎回新規作成）
+  2. 定期作成 — 日付入りの件名で作成する。既にあれば本文だけ更新する
+  3. 直接更新 — 既存の課題（と子課題）にコピー元の本文を反映する
+------------------------------------------------------------
+  0. 終了
+============================================================
+```
+
+モードを選ぶと、必要な項目だけを順に尋ねます。
+
+| モード | 尋ねる項目 |
+|---|---|
+| 単純複製 | コピー元の課題キー |
+| 定期作成 | コピー元の課題キー / 件名テンプレート / 日付 |
+| 直接更新 | コピー元の課題キー / 複製先の課題キー |
+
+- **件名テンプレートに `{YYYYMMDD}` が無い場合は日付を尋ねません。** 結果に影響しないためです。
+- 日付は「今日 / 明日 / 来週の月曜 / 手動入力」から選べます。
+- 前回入力した課題キーとテンプレートを覚えており、空 Enter でそのまま使えます
+  （`~/.backlog_issue_cloner_menu.json`）。
+- 最後にドライランか実行かを選びます。**実行内容の一覧と最終確認は本体が表示します。**
+- 接続設定を切り替える場合は `python3 menu.py --config other.yaml`。
+
+メニューは対話専用です。**無人実行には本体を直接使ってください**（[cron での自動実行](#cron-での自動実行)を参照）。
+
+### 最低限の設定ファイル
+
+メニューから使う場合、`config.yaml` は接続情報だけで足ります。
+
+```yaml
+backlog:
+  space_host: "myteam.backlog.com"
+  api_key: "YOUR_API_KEY_HERE"
+```
+
 ## 使い方
 
 デフォルトはドライランです。実際には何も作成・更新されません。
@@ -95,6 +148,31 @@ python3 backlog_issue_cloner.py --execute --date 20260401
 | `-y`, `--yes` | 確認プロンプトを出さずに実行する（自動実行向け） |
 | `--detailed-exit-code` | 正常終了時の結果を終了コードで区別する |
 | `--debug` | API リクエストの詳細を表示する（API キーはマスクされます） |
+
+### 設定の上書き
+
+設定ファイルの `clone` セクションを実行時に上書きできます。設定ファイルに接続情報だけを置き、
+複製の対象をコマンドラインで指定する使い方ができます（`menu.py` もこの仕組みで動いています）。
+
+| オプション | 説明 |
+|---|---|
+| `--source-issue-key KEY` | コピー元の課題キー |
+| `--target-issue-key KEY` | 複製先の課題キー（直接更新モードになる） |
+| `--summary-template TEMPLATE` | 件名テンプレート（定期作成モードになる） |
+| `--no-summary-template` | 設定ファイルの件名テンプレートを無視し、単純複製モードにする |
+
+```bash
+# 単純複製を 1 回だけ実行する
+python3 backlog_issue_cloner.py --source-issue-key PROJ-123 --execute
+
+# 既存の課題群にテンプレートの本文を反映し直す
+python3 backlog_issue_cloner.py --source-issue-key PROJ-123 \
+    --target-issue-key PROJ-456 --execute
+```
+
+`--summary-template` と `--no-summary-template` は同時に指定できません。
+`--target-issue-key` を指定すると、設定ファイルの `clone.target_project_key` は
+警告を出して無視されます（複製先はその課題のプロジェクトに決まるため）。
 
 ## 3 つの動作モード
 
@@ -375,8 +453,10 @@ esac
 テストは外部通信なしで完結します。
 
 ```bash
-python3 -m unittest test_backlog_issue_cloner -v
+python3 -m unittest test_backlog_issue_cloner test_menu -v
 ```
+
+メニューの対話ループ本体（`main`）は副作用が大きいため対象外にしています。
 
 ## ファイル構成
 
@@ -384,7 +464,9 @@ python3 -m unittest test_backlog_issue_cloner -v
 |---|---|
 | `README.md` | このドキュメント |
 | `backlog_issue_cloner.py` | 本体（API クライアント + CLI） |
+| `menu.py` | 対話メニュー（本体を subprocess で呼ぶ） |
 | `config.sample.yaml` | 設定ファイルのテンプレート |
-| `test_backlog_issue_cloner.py` | ユニットテスト |
+| `test_backlog_issue_cloner.py` | 本体のユニットテスト |
+| `test_menu.py` | メニューのユニットテスト |
 | `.gitignore` | `config.yaml` などを除外 |
 | `config.yaml` | 実際の設定。API キーを含むため Git 管理外 |
