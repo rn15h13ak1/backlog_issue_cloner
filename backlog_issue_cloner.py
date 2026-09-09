@@ -155,6 +155,34 @@ def configured_custom_field_params(spec) -> dict:
     return params
 
 
+def inherited_issue_params(issue: dict) -> dict:
+    """
+    コピー元の課題から引き継ぐ属性を、課題作成 API のパラメータ形式に変換する。
+
+    複製先はコピー元と同じプロジェクトに限られるため、カテゴリー・マイルストーン・
+    バージョンの ID をそのまま使える。実績時間は「実際に掛かった時間」なので
+    複製せず、添付ファイルは ID を渡しても複製できないため対象外。
+    """
+    params = {}
+
+    assignee = issue.get("assignee") or {}
+    if assignee.get("id") is not None:
+        params["assigneeId"] = assignee["id"]
+
+    for param, field in (("categoryId", "category"),
+                         ("versionId", "versions"),
+                         ("milestoneId", "milestone")):
+        ids = [v["id"] for v in (issue.get(field) or [])
+               if isinstance(v, dict) and v.get("id") is not None]
+        if ids:
+            params[param] = ids
+
+    if issue.get("estimatedHours") is not None:
+        params["estimatedHours"] = issue["estimatedHours"]
+
+    return params
+
+
 def custom_field_params(issue: dict) -> dict:
     """
     課題のカスタム属性を、課題作成 API のパラメータ形式に変換する。
@@ -680,6 +708,7 @@ def validate_config(config: dict) -> None:
         ("clone", c, "include_closed"),
         ("clone", c, "include_children"),
         ("clone", c, "copy_custom_fields"),
+        ("clone", c, "copy_attributes"),
     ):
         if key in section and not isinstance(section[key], bool):
             raise ConfigError(
@@ -760,8 +789,19 @@ def resolve_issue_type_id(
     return types[0]["id"], types[0]["name"]
 
 
-def resolve_priority_id(priorities: list, name: str | None) -> tuple[int, str]:
-    """優先度IDと優先度名を返す。見つからない場合は「中」→ 最初の優先度にフォールバック。"""
+def resolve_priority_id(
+    priorities: list, name: str | None, source_issue: dict | None = None
+) -> tuple[int, str]:
+    """
+    優先度IDと優先度名を返す。優先順位は次のとおり。
+
+      1. 設定の clone.priority で指定された優先度
+      2. コピー元課題と同じ優先度
+      3. 「中」
+      4. 最初の優先度
+
+    種別と同じく、既定ではコピー元に揃える。
+    """
     if name:
         matched = [p for p in priorities if p["name"] == name]
         if matched:
@@ -771,6 +811,12 @@ def resolve_priority_id(priorities: list, name: str | None) -> tuple[int, str]:
             f"警告: 優先度「{name}」が見つかりません。（利用可能: {available}）",
             file=sys.stderr,
         )
+    source_id = ((source_issue or {}).get("priority") or {}).get("id")
+    if source_id is not None:
+        matched = [p for p in priorities if p["id"] == source_id]
+        if matched:
+            return matched[0]["id"], matched[0]["name"]
+
     # フォールバック: "中" を探す
     chuu = [p for p in priorities if p["name"] == "中"]
     if chuu:
@@ -1063,6 +1109,7 @@ def run(args: argparse.Namespace, config: dict) -> str:
     include_closed = bool(clone_cfg.get("include_closed", False))
     status_ids = None if include_closed else STATUS_IDS_OPEN
     copy_custom_fields = bool(clone_cfg.get("copy_custom_fields", True))
+    copy_attributes = bool(clone_cfg.get("copy_attributes", True))
     # 設定で指定した値は、コピー元から引き継いだ値より優先する
     configured_fields = configured_custom_field_params(clone_cfg.get("custom_fields"))
 
@@ -1191,7 +1238,7 @@ def run(args: argparse.Namespace, config: dict) -> str:
             issue_types, clone_cfg.get("issue_type"), source_issue
         )
         priority_id, priority_name = resolve_priority_id(
-            priorities, clone_cfg.get("priority")
+            priorities, clone_cfg.get("priority"), source_issue
         )
         print(f"  種別（親）  : {issue_type_name} (id={issue_type_id})")
         print(f"  優先度（親）: {priority_name} (id={priority_id})")
@@ -1212,6 +1259,7 @@ def run(args: argparse.Namespace, config: dict) -> str:
             "issueTypeId": issue_type_id,
             "priorityId": priority_id,
             "description": source_desc,
+            **(inherited_issue_params(source_issue) if copy_attributes else {}),
             **(custom_field_params(source_issue) if copy_custom_fields else {}),
             **configured_fields,
         })
@@ -1239,6 +1287,7 @@ def run(args: argparse.Namespace, config: dict) -> str:
                 client, plan, parent_id, project_id, issue_types,
                 (issue_type_id, priority_id),
                 copy_custom_fields=copy_custom_fields,
+                copy_attributes=copy_attributes,
                 configured_fields=configured_fields,
             )
         )
@@ -1255,6 +1304,7 @@ def _apply_child_plan(
     parent_defaults: tuple,
     *,
     copy_custom_fields: bool = True,
+    copy_attributes: bool = True,
     configured_fields: dict | None = None,
 ) -> str:
     """1 件の子課題に対して計画した操作を実行し、実際の結果を返す。"""
@@ -1283,13 +1333,14 @@ def _apply_child_plan(
     )
     priority_id = (plan.source.get("priority") or {}).get("id") or fallback_priority_id
 
-    extra = {}
+    source = plan.source
+    # 課題一覧のレスポンスにカスタム属性が含まれない場合に備えて取得し直す
+    if copy_custom_fields and "customFields" not in source:
+        source = client.get_issue(source["issueKey"]) or source
+
+    extra = inherited_issue_params(source) if copy_attributes else {}
     if copy_custom_fields:
-        source = plan.source
-        # 課題一覧のレスポンスにカスタム属性が含まれない場合に備えて取得し直す
-        if "customFields" not in source:
-            source = client.get_issue(source["issueKey"]) or source
-        extra = custom_field_params(source)
+        extra.update(custom_field_params(source))
     extra.update(configured_fields or {})
 
     created = client.create_issue({

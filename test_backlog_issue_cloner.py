@@ -337,6 +337,68 @@ class TestCustomFieldParams(unittest.TestCase):
         )
 
 
+class TestInheritedIssueParams(unittest.TestCase):
+    """担当者・カテゴリー・マイルストーン・バージョン・予定時間の引き継ぎ。"""
+
+    def test_empty_issue(self):
+        self.assertEqual(sut.inherited_issue_params({}), {})
+
+    def test_assignee(self):
+        issue = {"assignee": {"id": 7, "name": "担当者"}}
+        self.assertEqual(sut.inherited_issue_params(issue), {"assigneeId": 7})
+
+    def test_unassigned_is_skipped(self):
+        for issue in ({"assignee": None}, {"assignee": {}}):
+            self.assertEqual(sut.inherited_issue_params(issue), {})
+
+    def test_category_version_milestone(self):
+        issue = {
+            "category": [{"id": 1}, {"id": 2}],
+            "versions": [{"id": 3}],
+            "milestone": [{"id": 4}],
+        }
+        self.assertEqual(
+            sut.inherited_issue_params(issue),
+            {"categoryId": [1, 2], "versionId": [3], "milestoneId": [4]},
+        )
+
+    def test_empty_lists_are_skipped(self):
+        issue = {"category": [], "versions": None, "milestone": []}
+        self.assertEqual(sut.inherited_issue_params(issue), {})
+
+    def test_estimated_hours(self):
+        self.assertEqual(
+            sut.inherited_issue_params({"estimatedHours": 3.5}),
+            {"estimatedHours": 3.5},
+        )
+
+    def test_zero_estimated_hours_is_kept(self):
+        self.assertEqual(
+            sut.inherited_issue_params({"estimatedHours": 0}), {"estimatedHours": 0}
+        )
+
+    def test_actual_hours_is_not_copied(self):
+        """実績時間は「実際に掛かった時間」なので複製しない。"""
+        self.assertEqual(sut.inherited_issue_params({"actualHours": 8}), {})
+
+    def test_attachments_are_not_copied(self):
+        """添付ファイルは ID を渡しても複製できない。"""
+        self.assertEqual(
+            sut.inherited_issue_params({"attachments": [{"id": 1, "name": "a.txt"}]}), {}
+        )
+
+    def test_status_and_resolution_are_not_copied(self):
+        issue = {"status": {"id": 4}, "resolution": {"id": 0}}
+        self.assertEqual(sut.inherited_issue_params(issue), {})
+
+    def test_list_params_are_expanded_for_the_api(self):
+        params = sut.inherited_issue_params({"category": [{"id": 1}, {"id": 2}]})
+        self.assertEqual(
+            sut._flatten_params(params),
+            [("categoryId[]", "1"), ("categoryId[]", "2")],
+        )
+
+
 class TestConfiguredCustomFieldParams(unittest.TestCase):
     """コピー元に値が無い必須属性を設定ファイルで補う。"""
 
@@ -761,6 +823,33 @@ class TestResolvePriorityId(unittest.TestCase):
         client.get_priorities.return_value = []
         with self.assertRaises(sut.ConfigError):
             sut.fetch_priorities(client)
+
+    # --- コピー元の優先度を引き継ぐ ---
+
+    def test_inherits_source_priority(self):
+        """設定が無ければコピー元と同じ優先度を使う（「中」ではない）。"""
+        source = {"priority": {"id": 2, "name": "高"}}
+        self.assertEqual(
+            sut.resolve_priority_id(self.PRIORITIES, None, source), (2, "高")
+        )
+
+    def test_configured_name_wins_over_source(self):
+        source = {"priority": {"id": 2, "name": "高"}}
+        self.assertEqual(
+            sut.resolve_priority_id(self.PRIORITIES, "低", source), (4, "低")
+        )
+
+    def test_falls_back_to_chuu_when_source_priority_absent(self):
+        source = {"priority": {"id": 99, "name": "この空間に無い優先度"}}
+        self.assertEqual(
+            sut.resolve_priority_id(self.PRIORITIES, None, source), (3, "中")
+        )
+
+    def test_source_without_priority(self):
+        for source in ({}, {"priority": None}):
+            self.assertEqual(
+                sut.resolve_priority_id(self.PRIORITIES, None, source), (3, "中")
+            )
 
 
 # ===========================================================================
@@ -1501,6 +1590,73 @@ class TestRunExecute(unittest.TestCase):
         self.assertEqual(
             mock_client.create_issue.call_args[0][0]["issueTypeId"], 2
         )
+
+    RICH_SOURCE = {
+        "assignee": {"id": 7, "name": "担当者"},
+        "category": [{"id": 21}],
+        "milestone": [{"id": 31}],
+        "versions": [{"id": 41}],
+        "estimatedHours": 3.5,
+        "actualHours": 8,
+        "priority": {"id": 2, "name": "高"},
+    }
+
+    def test_parent_inherits_source_priority(self):
+        """種別と同じく、優先度も既定でコピー元に揃える。"""
+        patcher, mock_client = _mock_client()
+        mock_client.get_issue.return_value = {**SOURCE_ISSUE, **self.RICH_SOURCE}
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        self.assertEqual(mock_client.create_issue.call_args[0][0]["priorityId"], 2)
+
+    def test_configured_priority_overrides_source(self):
+        patcher, mock_client = _mock_client()
+        mock_client.get_issue.return_value = {**SOURCE_ISSUE, **self.RICH_SOURCE}
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"),
+                    _make_config(priority="中"))
+        self.assertEqual(mock_client.create_issue.call_args[0][0]["priorityId"], 3)
+
+    def test_parent_inherits_attributes(self):
+        patcher, mock_client = _mock_client()
+        mock_client.get_issue.return_value = {**SOURCE_ISSUE, **self.RICH_SOURCE}
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        params = mock_client.create_issue.call_args[0][0]
+        self.assertEqual(params["assigneeId"], 7)
+        self.assertEqual(params["categoryId"], [21])
+        self.assertEqual(params["milestoneId"], [31])
+        self.assertEqual(params["versionId"], [41])
+        self.assertEqual(params["estimatedHours"], 3.5)
+        self.assertNotIn("actualHours", params)
+
+    def test_child_inherits_attributes(self):
+        child = {**_child(101, "PROJ-2", "手順1", "本文1"), **self.RICH_SOURCE,
+                 "customFields": []}
+        patcher, mock_client = _mock_client(source_children=[child])
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        params = mock_client.create_issue.call_args_list[1][0][0]
+        self.assertEqual(params["assigneeId"], 7)
+        self.assertEqual(params["categoryId"], [21])
+
+    def test_attributes_can_be_disabled(self):
+        cfg = _make_config()
+        cfg["clone"]["copy_attributes"] = False
+        patcher, mock_client = _mock_client()
+        mock_client.get_issue.return_value = {**SOURCE_ISSUE, **self.RICH_SOURCE}
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"), cfg)
+        params = mock_client.create_issue.call_args[0][0]
+        self.assertNotIn("assigneeId", params)
+        self.assertNotIn("categoryId", params)
+        # 優先度は copy_attributes とは独立に引き継ぐ
+        self.assertEqual(params["priorityId"], 2)
 
     def test_configured_custom_fields_fill_in_empty_source_value(self):
         """コピー元の必須属性が空でも、設定で指定した値で作成できる。"""
