@@ -965,7 +965,6 @@ def _make_config(
     api_key="TESTKEY",
     source_issue_key="PROJ-1",
     summary_template="【定期】{YYYYMMDD} タスク",
-    target_project_key=None,
     issue_type=None,
     priority=None,
     match_mode=None,
@@ -984,8 +983,6 @@ def _make_config(
             "summary_template": summary_template,
         },
     }
-    if target_project_key:
-        cfg["clone"]["target_project_key"] = target_project_key
     if issue_type:
         cfg["clone"]["issue_type"] = issue_type
     if priority:
@@ -1271,16 +1268,16 @@ class TestRunExecute(unittest.TestCase):
             sut.run(_make_args(execute=True, date="20260828"), _make_config())
         mock_client.get_project.assert_called_once_with("PROJ")
 
-    def test_target_project_key_override(self):
-        """target_project_key が設定されている場合はそちらを優先する。"""
+    def test_always_creates_in_source_project(self):
+        """複製先は常にコピー元と同じプロジェクト。"""
         patcher, mock_client = _mock_client()
         with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
-             patch("builtins.input", return_value="n"):
-            sut.run(
-                _make_args(execute=True, date="20260828"),
-                _make_config(target_project_key="OTHER"),
-            )
-        mock_client.get_project.assert_called_once_with("OTHER")
+             patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        self.assertEqual(
+            mock_client.create_issue.call_args[0][0]["projectId"],
+            SOURCE_ISSUE["projectId"],
+        )
 
     # --- 重複判定オプション ---
 
@@ -1399,13 +1396,20 @@ class TestValidateConfig(unittest.TestCase):
         with self.assertRaises(sut.ConfigError):
             sut.validate_config(cfg)
 
-    def test_target_issue_key_with_project_key_raises(self):
+    def test_target_project_key_is_rejected(self):
+        """廃止項目。黙って無視すると別プロジェクトに作られると誤解されるため止める。"""
         cfg = self._base_config()
-        cfg["clone"]["target_issue_key"] = "DEST-5"
         cfg["clone"]["target_project_key"] = "DEST"
         with self.assertRaises(sut.ConfigError) as ctx:
             sut.validate_config(cfg)
-        self.assertIn("同時に指定できません", str(ctx.exception))
+        self.assertIn("廃止", str(ctx.exception))
+
+    def test_target_project_key_rejected_even_with_target_issue_key(self):
+        cfg = self._base_config()
+        cfg["clone"]["target_issue_key"] = "PROJ-5"
+        cfg["clone"]["target_project_key"] = "DEST"
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config(cfg)
 
     def test_invalid_match_mode_raises(self):
         cfg = self._base_config()
@@ -1881,10 +1885,10 @@ class TestRunWithTargetIssueKey(unittest.TestCase):
 
     TARGET = {
         "id": 3001,
-        "issueKey": "DEST-5",
+        "issueKey": "PROJ-5",
         "summary": "複製先の件名",
         "description": "古い本文",
-        "projectId": 77,
+        "projectId": 10,
     }
     SOURCE_CHILDREN = [
         _child(101, "PROJ-2", "手順1 バックアップ", "本文1"),
@@ -1905,7 +1909,7 @@ class TestRunWithTargetIssueKey(unittest.TestCase):
              tty(), patch("builtins.input", return_value=answer):
             outcome = sut.run(
                 _make_args(execute=execute, date="20260828"),
-                config or _make_config(target_issue_key="DEST-5"),
+                config or _make_config(target_issue_key="PROJ-5"),
             )
         return outcome, mc, out.getvalue()
 
@@ -1913,7 +1917,7 @@ class TestRunWithTargetIssueKey(unittest.TestCase):
         outcome, mc, _ = self._run()
         self.assertEqual(outcome, sut.OUTCOME_UPDATED)
         mc.search_issues_by_keyword.assert_not_called()
-        mc.update_issue.assert_called_once_with("DEST-5", {"description": "本文テキスト"})
+        mc.update_issue.assert_called_once_with("PROJ-5", {"description": "本文テキスト"})
 
     def test_summary_is_not_changed(self):
         _, mc, out = self._run()
@@ -1929,20 +1933,20 @@ class TestRunWithTargetIssueKey(unittest.TestCase):
 
     def test_children_are_updated_one_by_one(self):
         existing_children = [
-            _child(901, "DEST-6", "手順1 バックアップ", "本文1"),   # 同一
-            _child(902, "DEST-7", "手順2 検証", "古い本文"),        # 差分
+            _child(901, "PROJ-6", "手順1 バックアップ", "本文1"),   # 同一
+            _child(902, "PROJ-7", "手順2 検証", "古い本文"),        # 差分
         ]
         outcome, mc, _ = self._run(
             source_children=self.SOURCE_CHILDREN, existing_children=existing_children
         )
         self.assertEqual(outcome, sut.OUTCOME_UPDATED)
         self.assertEqual(
-            [c[0][0] for c in mc.update_issue.call_args_list], ["DEST-5", "DEST-7"]
+            [c[0][0] for c in mc.update_issue.call_args_list], ["PROJ-5", "PROJ-7"]
         )
         mc.create_issue.assert_not_called()
 
     def test_missing_child_is_created_under_target(self):
-        existing_children = [_child(901, "DEST-6", "手順1 バックアップ", "本文1")]
+        existing_children = [_child(901, "PROJ-6", "手順1 バックアップ", "本文1")]
         outcome, mc, _ = self._run(
             source_children=self.SOURCE_CHILDREN, existing_children=existing_children
         )
@@ -1964,9 +1968,32 @@ class TestRunWithTargetIssueKey(unittest.TestCase):
             with self.assertRaises(sut.ConfigError) as ctx:
                 sut.run(
                     _make_args(execute=True, date="20260828"),
-                    _make_config(target_issue_key="DEST-999"),
+                    _make_config(target_issue_key="PROJ-999"),
                 )
         self.assertIn("コピー先課題", str(ctx.exception))
+
+    def test_target_in_another_project_raises_config_error(self):
+        """プロジェクトを跨いだ複製は事故防止のため拒否する。"""
+        other_project = {
+            "id": 3001, "issueKey": "DEST-5", "summary": "別プロジェクトの課題",
+            "description": "本文", "projectId": 99,
+        }
+        patcher, mc = _mock_client()
+        mc.get_issue.side_effect = lambda key: (
+            SOURCE_ISSUE if key == "PROJ-1" else other_project
+        )
+        with patcher, patch("sys.stdout", new_callable=StringIO):
+            with self.assertRaises(sut.ConfigError) as ctx:
+                sut.run(
+                    _make_args(execute=True, date="20260828"),
+                    _make_config(target_issue_key="DEST-5"),
+                )
+        message = str(ctx.exception)
+        self.assertIn("プロジェクトが異なります", message)
+        self.assertIn("PROJ", message)
+        self.assertIn("DEST", message)
+        mc.update_issue.assert_not_called()
+        mc.create_issue.assert_not_called()
 
     def test_same_source_and_target_raises_config_error(self):
         patcher, mc = _mock_client()
@@ -1987,7 +2014,7 @@ class TestRunWithTargetIssueKey(unittest.TestCase):
     def test_project_id_fetched_when_absent_on_target(self):
         target = {k: v for k, v in self.TARGET.items() if k != "projectId"}
         _, mc, _ = self._run(target=target)
-        mc.get_project.assert_called_once_with("DEST")
+        mc.get_project.assert_called_once_with("PROJ")
 
     def test_cancel_skips(self):
         outcome, mc, _ = self._run(answer="n")
@@ -2097,20 +2124,6 @@ class TestApplyCliOverrides(unittest.TestCase):
         cfg = self._config(source_issue_key="PROJ-1")
         out = sut.apply_cli_overrides(cfg, self._args(target_issue_key="DEST-5"))
         self.assertEqual(out["clone"]["target_issue_key"], "DEST-5")
-
-    def test_target_issue_key_drops_conflicting_project_key(self):
-        """両方あると validate_config で弾かれるため、設定ファイル側を取り下げる。"""
-        cfg = self._config(source_issue_key="PROJ-1", target_project_key="OTHER")
-        with patch("sys.stderr", new_callable=StringIO) as err:
-            out = sut.apply_cli_overrides(cfg, self._args(target_issue_key="DEST-5"))
-        self.assertNotIn("target_project_key", out["clone"])
-        self.assertIn("target_project_key", err.getvalue())
-        sut.validate_config(out)
-
-    def test_target_project_key_kept_without_target_issue_key(self):
-        cfg = self._config(source_issue_key="PROJ-1", target_project_key="OTHER")
-        out = sut.apply_cli_overrides(cfg, self._args(source_issue_key="PROJ-9"))
-        self.assertEqual(out["clone"]["target_project_key"], "OTHER")
 
     def test_none_config_passes_through(self):
         """空ファイルは validate_config 側で弾く。"""

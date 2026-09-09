@@ -500,16 +500,6 @@ def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
     if drop_template:
         clone.pop("summary_template", None)
 
-    # target_issue_key を指定した実行では複製先がその課題に決まるため、
-    # 設定ファイル側の target_project_key は意味を持たない。
-    # 残すと「同時に指定できません」で弾かれるので取り下げる。
-    if overrides["target_issue_key"] and clone.pop("target_project_key", None):
-        print(
-            "警告: --target-issue-key を指定したため、"
-            "設定ファイルの clone.target_project_key は無視します。",
-            file=sys.stderr,
-        )
-
     return {**config, "clone": clone}
 
 
@@ -556,18 +546,20 @@ def validate_config(config: dict) -> None:
             "（省略すればコピー元の件名をそのまま使います）"
         )
 
-    if "target_issue_key" in c:
-        if not c["target_issue_key"]:
-            raise ConfigError(
-                "config.yaml の clone.target_issue_key を空にはできません。"
-                "（件名で複製先を探す場合はこの項目ごと省略してください）"
-            )
-        if c.get("target_project_key"):
-            raise ConfigError(
-                "config.yaml の clone.target_issue_key と clone.target_project_key は"
-                "同時に指定できません。"
-                "（target_issue_key を指定した場合、複製先はその課題のプロジェクトになります）"
-            )
+    if "target_issue_key" in c and not c["target_issue_key"]:
+        raise ConfigError(
+            "config.yaml の clone.target_issue_key を空にはできません。"
+            "（件名で複製先を探す場合はこの項目ごと省略してください）"
+        )
+
+    # 廃止された項目。黙って無視すると、意図した別プロジェクトではなく
+    # コピー元のプロジェクトに作られてしまうため、明示的に止める。
+    if "target_project_key" in c:
+        raise ConfigError(
+            "config.yaml の clone.target_project_key は廃止されました。"
+            "プロジェクトを跨いだ複製には対応していないため、この項目を削除してください。"
+            "（複製先はコピー元と同じプロジェクトになります）"
+        )
 
     match_mode = c.get("match_mode", "substring")
     if match_mode not in MATCH_MODES:
@@ -967,6 +959,12 @@ def run(args: argparse.Namespace, config: dict) -> str:
     # "{SOURCE_SUMMARY}" を明示する。
     always_create = not target_issue_key and not summary_template
 
+    # 複製はコピー元と同じプロジェクト内でのみ行う。
+    # Backlog API の単一課題レスポンスには projectId（数値）のみ含まれ
+    # project オブジェクトはないため、issueKey（例: PROJ-123）のプレフィックスを
+    # プロジェクトキーとして使う。
+    target_project_key = source_issue["issueKey"].rsplit("-", 1)[0]
+
     if target_issue_key:
         # 5a. コピー先が明示されている場合は件名で探さず直接取得する
         print(f"コピー先課題を取得中: {target_issue_key}")
@@ -977,11 +975,15 @@ def run(args: argparse.Namespace, config: dict) -> str:
             raise ConfigError(
                 f"コピー元とコピー先が同じ課題です: {source_key}"
             )
+        existing_project_key = existing["issueKey"].rsplit("-", 1)[0]
+        if existing_project_key != target_project_key:
+            raise ConfigError(
+                f"コピー元（{target_project_key}）とコピー先（{existing_project_key}）の"
+                "プロジェクトが異なります。"
+                "プロジェクトを跨いだ複製には対応していません。"
+            )
         summary = existing.get("summary", "")  # 件名は変更しない
-        target_project_key = existing["issueKey"].rsplit("-", 1)[0]
         project_id = existing.get("projectId")
-        if project_id is None:
-            project_id = client.get_project(target_project_key)["id"]
     else:
         # 5b. 件名テンプレートを展開する
         summary = build_summary(
@@ -989,21 +991,12 @@ def run(args: argparse.Namespace, config: dict) -> str:
             source_issue.get("summary", ""),
             date_str,
         )
-        # Backlog API の単一課題レスポンスには projectId（数値）のみ含まれ
-        # project オブジェクトはない。コピー元と同じプロジェクトなら issueKey
-        #（例: PROJ-123）のプレフィックスをキーとし、ID は取得済みの
-        # source_issue["projectId"] を流用して API 呼び出しを 1 回節約する。
-        override_key = clone_cfg.get("target_project_key")
-        if override_key:
-            target_project_key = override_key
-            print(f"対象プロジェクトを取得中: {target_project_key}")
-            project_id = client.get_project(target_project_key)["id"]
-        else:
-            target_project_key = source_issue["issueKey"].rsplit("-", 1)[0]
-            project_id = source_issue.get("projectId")
-            if project_id is None:
-                print(f"対象プロジェクトを取得中: {target_project_key}")
-                project_id = client.get_project(target_project_key)["id"]
+        # ID は取得済みの source_issue["projectId"] を流用して API 呼び出しを節約する
+        project_id = source_issue.get("projectId")
+
+    if project_id is None:
+        print(f"対象プロジェクトを取得中: {target_project_key}")
+        project_id = client.get_project(target_project_key)["id"]
 
     # 6. 解決済み設定値を表示
     # 種別・優先度は新規作成でしか使わないため、ここでは解決しない。
