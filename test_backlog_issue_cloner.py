@@ -337,6 +337,38 @@ class TestCustomFieldParams(unittest.TestCase):
         )
 
 
+class TestConfiguredCustomFieldParams(unittest.TestCase):
+    """コピー元に値が無い必須属性を設定ファイルで補う。"""
+
+    def test_empty(self):
+        for spec in (None, {}, []):
+            self.assertEqual(sut.configured_custom_field_params(spec), {})
+
+    def test_int_and_string_keys(self):
+        self.assertEqual(
+            sut.configured_custom_field_params({11: [1], "12": "メモ"}),
+            {"customField_11": [1], "customField_12": "メモ"},
+        )
+
+    def test_none_value_is_skipped(self):
+        self.assertEqual(sut.configured_custom_field_params({11: None}), {})
+
+    def test_non_mapping_raises(self):
+        with self.assertRaises(sut.ConfigError):
+            sut.configured_custom_field_params("リストでない")
+
+    def test_non_numeric_key_raises(self):
+        with self.assertRaises(sut.ConfigError) as ctx:
+            sut.configured_custom_field_params({"作業完了チェック": [1]})
+        self.assertIn("ID", str(ctx.exception))
+
+    def test_validated_by_validate_config(self):
+        cfg = {"backlog": {"space_host": "h", "api_key": "K"},
+               "clone": {"source_issue_key": "PROJ-1", "custom_fields": {"x": 1}}}
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config(cfg)
+
+
 class TestFlattenParams(unittest.TestCase):
     """_flatten_params — GET のクエリと POST のボディで共用する展開処理。"""
 
@@ -1414,6 +1446,51 @@ class TestRunExecute(unittest.TestCase):
         self.assertEqual(
             [c[0][0] for c in mock_client.get_issue.call_args_list], ["PROJ-1"]
         )
+
+    def test_configured_custom_fields_fill_in_empty_source_value(self):
+        """コピー元の必須属性が空でも、設定で指定した値で作成できる。"""
+        cfg = _make_config()
+        cfg["clone"]["custom_fields"] = {11: [1]}
+        patcher, mock_client = _mock_client()
+        mock_client.get_issue.return_value = {
+            **SOURCE_ISSUE,
+            "customFields": [{"id": 11, "fieldTypeId": 7, "name": "作業完了チェック",
+                              "value": None}],
+        }
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"), cfg)
+        self.assertEqual(
+            mock_client.create_issue.call_args[0][0]["customField_11"], [1]
+        )
+
+    def test_configured_custom_fields_override_source(self):
+        cfg = _make_config()
+        cfg["clone"]["custom_fields"] = {11: [2]}
+        patcher, mock_client = _mock_client()
+        mock_client.get_issue.return_value = {
+            **SOURCE_ISSUE,
+            "customFields": [{"id": 11, "fieldTypeId": 7, "name": "チェック",
+                              "value": [{"id": 1}]}],
+        }
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"), cfg)
+        self.assertEqual(
+            mock_client.create_issue.call_args[0][0]["customField_11"], [2]
+        )
+
+    def test_configured_custom_fields_applied_to_children(self):
+        cfg = _make_config()
+        cfg["clone"]["custom_fields"] = {11: [1]}
+        child = _child(101, "PROJ-2", "手順1", "本文1")
+        child["customFields"] = []
+        patcher, mock_client = _mock_client(source_children=[child])
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"), cfg)
+        child_params = mock_client.create_issue.call_args_list[1][0][0]
+        self.assertEqual(child_params["customField_11"], [1])
 
     def test_always_creates_in_source_project(self):
         """複製先は常にコピー元と同じプロジェクト。"""

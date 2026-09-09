@@ -123,6 +123,37 @@ CUSTOM_FIELD_DATE = 4
 CUSTOM_FIELD_SINGLE_SELECT = (5, 8)
 CUSTOM_FIELD_MULTI_SELECT = (6, 7)
 
+CUSTOM_FIELD_TYPE_NAMES = {
+    1: "文字列", 2: "文章", 3: "数値", 4: "日付",
+    5: "単一リスト", 6: "複数リスト", 7: "チェックボックス", 8: "ラジオボタン",
+}
+
+
+def configured_custom_field_params(spec) -> dict:
+    """
+    設定ファイルの clone.custom_fields を作成 API のパラメータ形式に変換する。
+    コピー元に値が入っていない必須のカスタム属性を補うために使う。
+    """
+    if not spec:
+        return {}
+    if not isinstance(spec, dict):
+        raise ConfigError(
+            "config.yaml の clone.custom_fields は"
+            "「カスタム属性の ID: 値」の形式で指定してください。"
+        )
+    params = {}
+    for key, value in spec.items():
+        field_id = str(key)
+        if not field_id.isdigit():
+            raise ConfigError(
+                "config.yaml の clone.custom_fields のキーはカスタム属性の ID"
+                f"（数値）で指定してください: {key!r}"
+            )
+        if value is None:
+            continue
+        params[f"customField_{field_id}"] = value
+    return params
+
 
 def custom_field_params(issue: dict) -> dict:
     """
@@ -268,7 +299,14 @@ class BacklogClient:
         elif raw_body:
             message += f"\n  レスポンス: {raw_body[:500]}"
 
-        raise BacklogError(message, status=e.code, hint=HTTP_ERROR_HINTS.get(e.code))
+        hint = HTTP_ERROR_HINTS.get(e.code)
+        if e.code == 400 and "必須" in detail:
+            hint = (
+                "必須のカスタム属性に値が入っていない可能性があります。"
+                "--show-source でコピー元の値を確認し、"
+                "コピー元に値を入れるか config.yaml の clone.custom_fields で指定してください。"
+            )
+        raise BacklogError(message, status=e.code, hint=hint)
 
     def _retry_delay(self, error: urllib.error.HTTPError | None, attempt: int) -> float:
         """リトライまでの待機秒数。Retry-After ヘッダがあれば優先する。"""
@@ -633,6 +671,8 @@ def validate_config(config: dict) -> None:
             "config.yaml の clone.child_summary_template を空にはできません。"
             "（省略時は {SOURCE_SUMMARY}、つまりコピー元の子課題の件名をそのまま使います）"
         )
+
+    configured_custom_field_params(c.get("custom_fields"))
 
     # 真偽値設定: "false" のような文字列を真と誤解しないよう型を確認する
     for section_name, section, key in (
@@ -1000,6 +1040,8 @@ def run(args: argparse.Namespace, config: dict) -> str:
     include_closed = bool(clone_cfg.get("include_closed", False))
     status_ids = None if include_closed else STATUS_IDS_OPEN
     copy_custom_fields = bool(clone_cfg.get("copy_custom_fields", True))
+    # 設定で指定した値は、コピー元から引き継いだ値より優先する
+    configured_fields = configured_custom_field_params(clone_cfg.get("custom_fields"))
 
     # 5. コピー先を確定する
     target_issue_key = clone_cfg.get("target_issue_key")
@@ -1148,6 +1190,7 @@ def run(args: argparse.Namespace, config: dict) -> str:
             "priorityId": priority_id,
             "description": source_desc,
             **(custom_field_params(source_issue) if copy_custom_fields else {}),
+            **configured_fields,
         })
         parent_id = created["id"]
         print(f"作成完了: {created['issueKey']} — {created['summary']}")
@@ -1173,6 +1216,7 @@ def run(args: argparse.Namespace, config: dict) -> str:
                 client, plan, parent_id, project_id, issue_types,
                 (issue_type_id, priority_id),
                 copy_custom_fields=copy_custom_fields,
+                configured_fields=configured_fields,
             )
         )
 
@@ -1188,6 +1232,7 @@ def _apply_child_plan(
     parent_defaults: tuple,
     *,
     copy_custom_fields: bool = True,
+    configured_fields: dict | None = None,
 ) -> str:
     """1 件の子課題に対して計画した操作を実行し、実際の結果を返す。"""
     if plan.action == OUTCOME_NO_CHANGE:
@@ -1222,6 +1267,7 @@ def _apply_child_plan(
         if "customFields" not in source:
             source = client.get_issue(source["issueKey"]) or source
         extra = custom_field_params(source)
+    extra.update(configured_fields or {})
 
     created = client.create_issue({
         "projectId": project_id,
@@ -1234,6 +1280,55 @@ def _apply_child_plan(
     })
     print(f"  [子] 作成完了: {created['issueKey']} — {created['summary']}")
     return OUTCOME_CREATED
+
+
+def show_source_issue(args: argparse.Namespace, config: dict) -> None:
+    """コピー元課題のカスタム属性を一覧表示する（--show-source）。"""
+    backlog_cfg = config["backlog"]
+    clone_cfg = config["clone"]
+    client = BacklogClient(
+        space_host=backlog_cfg["space_host"],
+        api_key=backlog_cfg["api_key"],
+        ssl_verify=backlog_cfg.get("ssl_verify", True),
+        base_path=backlog_cfg.get("base_path", ""),
+        debug=args.debug,
+        timeout=backlog_cfg.get("timeout", 30),
+        max_retries=backlog_cfg.get("max_retries", 3),
+    )
+    source_key = clone_cfg["source_issue_key"]
+    issue = client.get_issue(source_key)
+    if issue is None:
+        raise ConfigError(f"コピー元課題「{source_key}」が見つかりません。")
+
+    print(f"コピー元課題: {issue['issueKey']} — {issue.get('summary', '')}")
+    fields = issue.get("customFields")
+    if fields is None:
+        print("  カスタム属性: レスポンスに含まれていません")
+        return
+    if not fields:
+        print("  カスタム属性: ありません")
+        return
+
+    print("  カスタム属性:")
+    empty = []
+    for field in fields:
+        type_name = CUSTOM_FIELD_TYPE_NAMES.get(field.get("fieldTypeId"), "不明")
+        value = field.get("value")
+        shown = "（未設定）" if value is None or value == [] else repr(value)
+        print(f"    id={field.get('id')}  {type_name}  "
+              f"{field.get('name', '')!r}  値: {shown}")
+        if value is None or value == []:
+            empty.append(field)
+
+    sent = custom_field_params(issue)
+    print(f"\n  作成時に渡す値: {sent or 'なし'}")
+    if empty:
+        ids = "、".join(str(f.get("id")) for f in empty)
+        print(
+            f"\n  値が未設定の属性があります（id={ids}）。\n"
+            "  これらが必須の場合、コピー元に値を入れるか、"
+            "config.yaml の clone.custom_fields で指定してください。"
+        )
 
 
 def exit_code_for(outcome: str, detailed: bool) -> int:
@@ -1308,6 +1403,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="API リクエストの詳細を表示する",
     )
+    parser.add_argument(
+        "--show-source",
+        action="store_true",
+        help="コピー元課題のカスタム属性を表示して終了する（作成・更新はしない）",
+    )
 
     override = parser.add_argument_group(
         "設定の上書き",
@@ -1356,6 +1456,10 @@ def main() -> None:
             + ("DRY RUN（実際の作成/更新は行いません）" if dry_run else "EXECUTE（Backlog に作成/更新します）")
         )
         print()
+
+        if args.show_source:
+            show_source_issue(args, config)
+            sys.exit(EXIT_OK)
 
         outcome = run(args, config)
     except ConfigError as e:
