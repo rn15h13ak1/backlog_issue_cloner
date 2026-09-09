@@ -773,7 +773,15 @@ esac
 テストは外部通信なしで完結します。
 
 ```bash
-python3 -m unittest test_backlog_issue_cloner test_menu -v
+python3 -m unittest discover -s tests -t .
+```
+
+カバレッジを測る場合:
+
+```bash
+pip3 install coverage
+python3 -m coverage run --branch --source=backlog_issue_cloner,menu -m unittest discover -s tests -t .
+python3 -m coverage report -m
 ```
 
 メニューの対話ループ本体（`main`）は副作用が大きいため対象外にしています。
@@ -786,7 +794,7 @@ python3 -m unittest test_backlog_issue_cloner test_menu -v
 | `backlog_issue_cloner.py` | 本体（API クライアント + CLI） |
 | `menu.py` | 対話メニュー（本体を subprocess で呼ぶ） |
 | `config.sample.yaml` | 設定ファイルのテンプレート |
-| `test_backlog_issue_cloner.py` | 本体のユニットテスト |
-| `test_menu.py` | メニューのユニットテスト |
+| `tests/test_backlog_issue_cloner.py` | 本体のユニットテスト |
+| `tests/test_menu.py` | メニューのユニットテスト |
 | `.gitignore` | `config.yaml` などを除外 |
 | `config.yaml` | 実際の設定。API キーを含むため Git 管理外 |
