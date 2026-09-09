@@ -3,7 +3,11 @@ Backlog 課題クローンツール
 ==========================
 指定した課題の description をコピーして新規課題を作成する CLI ツール。
 親課題を指定した場合は、その子課題もまとめて複製する。
-clone.target_issue_key を指定すると、件名で探さずその課題（と子課題）を直接更新する。
+
+複製先の決め方は設定で 3 通りに変わる:
+  どちらも省略             : 重複チェックせず毎回新規作成（単純複製）
+  clone.summary_template   : その件名で探し、無ければ作成・あれば更新（定期作成）
+  clone.target_issue_key   : 検索せずその課題（と子課題）を直接更新（直接更新）
 
 使い方:
   python3 backlog_issue_cloner.py                    # ドライラン（デフォルト）
@@ -891,6 +895,13 @@ def run(args: argparse.Namespace, config: dict) -> str:
 
     # 5. コピー先を確定する
     target_issue_key = clone_cfg.get("target_issue_key")
+    summary_template = clone_cfg.get("summary_template")
+    # summary_template も target_issue_key も無い場合、複製先を特定する手掛かりが
+    # ないため重複チェックを行わず、実行のたびに新しい課題を作る。
+    # コピー元と同じ件名で重複チェックしたい場合は summary_template に
+    # "{SOURCE_SUMMARY}" を明示する。
+    always_create = not target_issue_key and not summary_template
+
     if target_issue_key:
         # 5a. コピー先が明示されている場合は件名で探さず直接取得する
         print(f"コピー先課題を取得中: {target_issue_key}")
@@ -907,9 +918,9 @@ def run(args: argparse.Namespace, config: dict) -> str:
         if project_id is None:
             project_id = client.get_project(target_project_key)["id"]
     else:
-        # 5b. 件名テンプレートを展開して既存課題を探す
+        # 5b. 件名テンプレートを展開する
         summary = build_summary(
-            clone_cfg.get("summary_template") or DEFAULT_SUMMARY_TEMPLATE,
+            summary_template or DEFAULT_SUMMARY_TEMPLATE,
             source_issue.get("summary", ""),
             date_str,
         )
@@ -941,20 +952,25 @@ def run(args: argparse.Namespace, config: dict) -> str:
     if target_issue_key:
         print(f"  コピー先    : {target_issue_key}（件名は変更しません）")
         print(f"  子課題照合  : {match_mode}")
+    elif always_create:
+        print("  重複判定    : 行わない（毎回新しい課題を作成）")
     else:
         print(f"  重複判定    : {match_mode}"
               f"（完了済み課題を{'含む' if include_closed else '除く'}）")
 
-    # 7. コピー先が明示されていなければ既存課題を検索する
+    # 7. 複製先を検索する（コピー先が明示されている場合は 5a で確定済み）
     if not target_issue_key:
-        print(f"\n既存課題を検索中（件名: {summary!r}）...")
-        existing = find_existing_by_summary(
-            client, project_id, summary,
-            match_mode=match_mode,
-            status_ids=status_ids,
-            # 件名テンプレート省略時はコピー元と同じ件名になるため自分自身を除く
-            exclude_id=source_issue.get("id"),
-        )
+        if always_create:
+            existing = None
+        else:
+            print(f"\n既存課題を検索中（件名: {summary!r}）...")
+            existing = find_existing_by_summary(
+                client, project_id, summary,
+                match_mode=match_mode,
+                status_ids=status_ids,
+                # "{SOURCE_SUMMARY}" 指定時はコピー元と同じ件名になるため自分自身を除く
+                exclude_id=source_issue.get("id"),
+            )
 
     # 8. 親課題の操作を決める
     if existing is None:

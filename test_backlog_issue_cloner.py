@@ -1760,29 +1760,68 @@ class TestRunWithoutSummaryTemplate(unittest.TestCase):
             )
         return outcome, mc, out.getvalue()
 
+    SAME_SUMMARY_ISSUE = {
+        "id": 2002,
+        "issueKey": "PROJ-50",
+        "summary": SOURCE_ISSUE["summary"],
+        "description": "古い本文",
+    }
+
     def test_uses_source_summary_as_is(self):
         outcome, mc, _ = self._run(search_results=[])
         self.assertEqual(outcome, sut.OUTCOME_CREATED)
         params = mc.create_issue.call_args[0][0]
         self.assertEqual(params["summary"], SOURCE_ISSUE["summary"])
 
-    def test_source_issue_itself_is_not_treated_as_existing(self):
-        """コピー元と同じ件名になるため、コピー元自身を既存扱いしない。"""
-        outcome, mc, _ = self._run(search_results=[SOURCE_ISSUE])
+    def test_skips_duplicate_check_entirely(self):
+        """複製先を特定する手掛かりが無いため重複チェックを行わない。"""
+        outcome, mc, out = self._run(search_results=[self.SAME_SUMMARY_ISSUE])
         self.assertEqual(outcome, sut.OUTCOME_CREATED)
-        mc.create_issue.assert_called_once()
+        mc.search_issues_by_keyword.assert_not_called()
         mc.update_issue.assert_not_called()
+        mc.create_issue.assert_called_once()
+        self.assertIn("重複判定", out)
+        self.assertIn("行わない", out)
 
-    def test_other_issue_with_same_summary_is_updated(self):
-        other = {
-            "id": 2002,
-            "issueKey": "PROJ-50",
-            "summary": SOURCE_ISSUE["summary"],
-            "description": "古い本文",
-        }
-        outcome, mc, _ = self._run(search_results=[SOURCE_ISSUE, other])
+    def test_creates_again_on_second_run(self):
+        """同じ設定で繰り返すたびに新しい課題が作られる。"""
+        for _ in range(2):
+            outcome, mc, _ = self._run(search_results=[self.SAME_SUMMARY_ISSUE])
+            self.assertEqual(outcome, sut.OUTCOME_CREATED)
+            mc.create_issue.assert_called_once()
+
+    def test_children_are_all_created(self):
+        """毎回新規作成なので既存の子課題を引きに行かない。"""
+        patcher, mc = _mock_client(
+            source_children=[_child(101, "PROJ-2", "手順1", "本文1")]
+        )
+        with patcher, patch("sys.stdout", new_callable=StringIO), \
+             patch("sys.stderr", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            sut.run(
+                _make_args(execute=True, date="20260828"),
+                _make_config(summary_template=None),
+            )
+        # コピー元の子課題のみ照会し、複製先の子課題は引かない
+        self.assertEqual(
+            [c[0][0] for c in mc.get_child_issues.call_args_list], [SOURCE_ISSUE["id"]]
+        )
+        self.assertEqual(mc.create_issue.call_count, 2)  # 親 1 + 子 1
+
+    def test_explicit_source_summary_template_enables_duplicate_check(self):
+        """明示的に {SOURCE_SUMMARY} と書いた場合は重複チェックする。"""
+        cfg = _make_config(summary_template="{SOURCE_SUMMARY}")
+        outcome, mc, _ = self._run(search_results=[self.SAME_SUMMARY_ISSUE], config=cfg)
+        mc.search_issues_by_keyword.assert_called_once()
         self.assertEqual(outcome, sut.OUTCOME_UPDATED)
         mc.update_issue.assert_called_once_with("PROJ-50", {"description": "本文テキスト"})
+
+    def test_explicit_source_summary_template_excludes_source_itself(self):
+        """明示指定時はコピー元と同じ件名になるため、コピー元自身は除外する。"""
+        cfg = _make_config(summary_template="{SOURCE_SUMMARY}")
+        outcome, mc, _ = self._run(search_results=[SOURCE_ISSUE], config=cfg)
+        self.assertEqual(outcome, sut.OUTCOME_CREATED)
+        mc.update_issue.assert_not_called()
 
     def test_explicit_template_still_works(self):
         outcome, mc, _ = self._run(search_results=[], config=_make_config())
