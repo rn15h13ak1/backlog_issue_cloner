@@ -116,6 +116,55 @@ HTTP_ERROR_HINTS = {
 }
 
 
+# カスタム属性の種別 ID（Backlog 共通）
+# 1 文字列 / 2 文章 / 3 数値 / 4 日付 / 5 単一リスト / 6 複数リスト
+# 7 チェックボックス / 8 ラジオボタン
+CUSTOM_FIELD_DATE = 4
+CUSTOM_FIELD_SINGLE_SELECT = (5, 8)
+CUSTOM_FIELD_MULTI_SELECT = (6, 7)
+
+
+def custom_field_params(issue: dict) -> dict:
+    """
+    課題のカスタム属性を、課題作成 API のパラメータ形式に変換する。
+
+    必須のカスタム属性があるプロジェクトでは、これを渡さないと課題の作成が
+    「〜は必須です」で 400 になる。複製先はコピー元と同じプロジェクトに
+    限られるため、属性 ID をそのまま使える。
+    """
+    params = {}
+    for field in issue.get("customFields") or []:
+        field_id = field.get("id")
+        value = field.get("value")
+        if field_id is None or value is None or value == []:
+            continue
+
+        key = f"customField_{field_id}"
+        type_id = field.get("fieldTypeId")
+
+        if type_id in CUSTOM_FIELD_MULTI_SELECT:
+            ids = [v["id"] for v in value
+                   if isinstance(v, dict) and v.get("id") is not None]
+            if not ids:
+                continue
+            params[key] = ids
+        elif type_id in CUSTOM_FIELD_SINGLE_SELECT:
+            if not isinstance(value, dict) or value.get("id") is None:
+                continue
+            params[key] = value["id"]
+        elif type_id == CUSTOM_FIELD_DATE:
+            # 読み取り時は "2026-09-09T00:00:00Z" 形式だが、書き込みは日付のみ
+            params[key] = str(value)[:10]
+        else:
+            params[key] = value
+
+        # リスト系で「その他」が入力されている場合に付随する値
+        other = field.get("otherValue")
+        if other:
+            params[f"{key}_otherValue"] = other
+    return params
+
+
 def _flatten_params(params: dict) -> list[tuple[str, str]]:
     """
     パラメータ dict を (キー, 値) のペア列に展開する。
@@ -590,6 +639,7 @@ def validate_config(config: dict) -> None:
         ("backlog", b, "ssl_verify"),
         ("clone", c, "include_closed"),
         ("clone", c, "include_children"),
+        ("clone", c, "copy_custom_fields"),
     ):
         if key in section and not isinstance(section[key], bool):
             raise ConfigError(
@@ -949,6 +999,7 @@ def run(args: argparse.Namespace, config: dict) -> str:
     match_mode = clone_cfg.get("match_mode", "substring")
     include_closed = bool(clone_cfg.get("include_closed", False))
     status_ids = None if include_closed else STATUS_IDS_OPEN
+    copy_custom_fields = bool(clone_cfg.get("copy_custom_fields", True))
 
     # 5. コピー先を確定する
     target_issue_key = clone_cfg.get("target_issue_key")
@@ -1096,6 +1147,7 @@ def run(args: argparse.Namespace, config: dict) -> str:
             "issueTypeId": issue_type_id,
             "priorityId": priority_id,
             "description": source_desc,
+            **(custom_field_params(source_issue) if copy_custom_fields else {}),
         })
         parent_id = created["id"]
         print(f"作成完了: {created['issueKey']} — {created['summary']}")
@@ -1107,8 +1159,10 @@ def run(args: argparse.Namespace, config: dict) -> str:
                     existing["issueKey"], {"description": source_desc}
                 )
                 print(f"更新完了: {updated['issueKey']} — {updated['summary']}")
-            except BacklogNoChangeError:
-                print(f"スキップ（変更なし）: {existing['issueKey']}")
+            except BacklogNoChangeError as e:
+                # Backlog はバリデーションエラーにも同じコードを返すため、
+                # サーバのメッセージを併記して取り違えに気付けるようにする
+                print(f"スキップ（変更なしと判断）: {existing['issueKey']} — {e}")
                 parent_action = OUTCOME_NO_CHANGE
 
     # 13. 子課題を作成・更新する
@@ -1118,6 +1172,7 @@ def run(args: argparse.Namespace, config: dict) -> str:
             _apply_child_plan(
                 client, plan, parent_id, project_id, issue_types,
                 (issue_type_id, priority_id),
+                copy_custom_fields=copy_custom_fields,
             )
         )
 
@@ -1131,6 +1186,8 @@ def _apply_child_plan(
     project_id: int,
     issue_types: list | None,
     parent_defaults: tuple,
+    *,
+    copy_custom_fields: bool = True,
 ) -> str:
     """1 件の子課題に対して計画した操作を実行し、実際の結果を返す。"""
     if plan.action == OUTCOME_NO_CHANGE:
@@ -1143,8 +1200,10 @@ def _apply_child_plan(
             updated = client.update_issue(
                 plan.existing["issueKey"], {"description": source_desc}
             )
-        except BacklogNoChangeError:
-            print(f"  [子] スキップ（変更なし）: {plan.existing['issueKey']}")
+        except BacklogNoChangeError as e:
+            print(
+                f"  [子] スキップ（変更なしと判断）: {plan.existing['issueKey']} — {e}"
+            )
             return OUTCOME_NO_CHANGE
         print(f"  [子] 更新完了: {updated['issueKey']} — {updated['summary']}")
         return OUTCOME_UPDATED
@@ -1155,6 +1214,15 @@ def _apply_child_plan(
         issue_types or [], plan.source, (fallback_type_id, "")
     )
     priority_id = (plan.source.get("priority") or {}).get("id") or fallback_priority_id
+
+    extra = {}
+    if copy_custom_fields:
+        source = plan.source
+        # 課題一覧のレスポンスにカスタム属性が含まれない場合に備えて取得し直す
+        if "customFields" not in source:
+            source = client.get_issue(source["issueKey"]) or source
+        extra = custom_field_params(source)
+
     created = client.create_issue({
         "projectId": project_id,
         "summary": plan.summary,
@@ -1162,6 +1230,7 @@ def _apply_child_plan(
         "priorityId": priority_id,
         "description": source_desc,
         "parentIssueId": parent_id,
+        **extra,
     })
     print(f"  [子] 作成完了: {created['issueKey']} — {created['summary']}")
     return OUTCOME_CREATED

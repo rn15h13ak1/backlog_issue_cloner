@@ -260,6 +260,83 @@ class TestSearchIssuesPagination(unittest.TestCase):
 # ===========================================================================
 
 
+class TestCustomFieldParams(unittest.TestCase):
+    """必須のカスタム属性があるプロジェクトでは、渡さないと作成が 400 になる。"""
+
+    def _field(self, id_, type_id, value, **extra):
+        return {"id": id_, "fieldTypeId": type_id, "name": "属性",
+                "value": value, **extra}
+
+    def test_no_custom_fields(self):
+        self.assertEqual(sut.custom_field_params({}), {})
+        self.assertEqual(sut.custom_field_params({"customFields": None}), {})
+        self.assertEqual(sut.custom_field_params({"customFields": []}), {})
+
+    def test_text_and_number(self):
+        issue = {"customFields": [self._field(1, 1, "文字列"), self._field(2, 3, 42)]}
+        self.assertEqual(
+            sut.custom_field_params(issue),
+            {"customField_1": "文字列", "customField_2": 42},
+        )
+
+    def test_date_is_trimmed_to_day(self):
+        """読み取りは ISO 形式だが、書き込みは日付のみを受け付ける。"""
+        issue = {"customFields": [self._field(3, 4, "2026-09-09T00:00:00Z")]}
+        self.assertEqual(sut.custom_field_params(issue), {"customField_3": "2026-09-09"})
+
+    def test_single_select_sends_id(self):
+        issue = {"customFields": [self._field(4, 5, {"id": 77, "name": "選択肢"})]}
+        self.assertEqual(sut.custom_field_params(issue), {"customField_4": 77})
+
+    def test_radio_sends_id(self):
+        issue = {"customFields": [self._field(5, 8, {"id": 88, "name": "選択肢"})]}
+        self.assertEqual(sut.custom_field_params(issue), {"customField_5": 88})
+
+    def test_checkbox_sends_id_list(self):
+        """「作業完了チェック」のようなチェックボックスは ID の配列で送る。"""
+        issue = {"customFields": [
+            self._field(6, 7, [{"id": 1, "name": "A"}, {"id": 2, "name": "B"}])
+        ]}
+        self.assertEqual(sut.custom_field_params(issue), {"customField_6": [1, 2]})
+
+    def test_multi_select_sends_id_list(self):
+        issue = {"customFields": [self._field(7, 6, [{"id": 9, "name": "X"}])]}
+        self.assertEqual(sut.custom_field_params(issue), {"customField_7": [9]})
+
+    def test_other_value_is_included(self):
+        issue = {"customFields": [
+            self._field(8, 5, {"id": 3, "name": "その他"}, otherValue="自由記入")
+        ]}
+        self.assertEqual(
+            sut.custom_field_params(issue),
+            {"customField_8": 3, "customField_8_otherValue": "自由記入"},
+        )
+
+    def test_empty_values_are_skipped(self):
+        issue = {"customFields": [
+            self._field(1, 1, None), self._field(2, 7, []),
+            self._field(3, 5, None), {"fieldTypeId": 1, "value": "id が無い"},
+        ]}
+        self.assertEqual(sut.custom_field_params(issue), {})
+
+    def test_malformed_select_is_skipped(self):
+        issue = {"customFields": [
+            self._field(1, 5, "オブジェクトでない"),
+            self._field(2, 7, ["オブジェクトでない"]),
+        ]}
+        self.assertEqual(sut.custom_field_params(issue), {})
+
+    def test_list_values_are_expanded_for_the_api(self):
+        """チェックボックスは customField_6[]=1&customField_6[]=2 の形で送られる。"""
+        params = sut.custom_field_params(
+            {"customFields": [self._field(6, 7, [{"id": 1}, {"id": 2}])]}
+        )
+        self.assertEqual(
+            sut._flatten_params(params),
+            [("customField_6[]", "1"), ("customField_6[]", "2")],
+        )
+
+
 class TestFlattenParams(unittest.TestCase):
     """_flatten_params — GET のクエリと POST のボディで共用する展開処理。"""
 
@@ -1267,6 +1344,76 @@ class TestRunExecute(unittest.TestCase):
              patch("builtins.input", return_value="n"):
             sut.run(_make_args(execute=True, date="20260828"), _make_config())
         mock_client.get_project.assert_called_once_with("PROJ")
+
+    # --- カスタム属性の引き継ぎ ---
+
+    CUSTOM_FIELDS = [
+        {"id": 11, "fieldTypeId": 7, "name": "作業完了チェック",
+         "value": [{"id": 1, "name": "済"}]},
+        {"id": 12, "fieldTypeId": 1, "name": "備考", "value": "メモ"},
+    ]
+
+    def test_custom_fields_are_copied_on_create(self):
+        """必須のカスタム属性があるプロジェクトでも作成できるようにする。"""
+        patcher, mock_client = _mock_client()
+        mock_client.get_issue.return_value = {
+            **SOURCE_ISSUE, "customFields": self.CUSTOM_FIELDS
+        }
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        params = mock_client.create_issue.call_args[0][0]
+        self.assertEqual(params["customField_11"], [1])
+        self.assertEqual(params["customField_12"], "メモ")
+
+    def test_custom_fields_can_be_disabled(self):
+        cfg = _make_config()
+        cfg["clone"]["copy_custom_fields"] = False
+        patcher, mock_client = _mock_client()
+        mock_client.get_issue.return_value = {
+            **SOURCE_ISSUE, "customFields": self.CUSTOM_FIELDS
+        }
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"), cfg)
+        params = mock_client.create_issue.call_args[0][0]
+        self.assertNotIn("customField_11", params)
+
+    def test_child_custom_fields_are_copied(self):
+        child = _child(101, "PROJ-2", "手順1", "本文1")
+        child["customFields"] = self.CUSTOM_FIELDS
+        patcher, mock_client = _mock_client(source_children=[child])
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        child_params = mock_client.create_issue.call_args_list[1][0][0]
+        self.assertEqual(child_params["customField_11"], [1])
+
+    def test_child_is_refetched_when_custom_fields_absent(self):
+        """課題一覧のレスポンスにカスタム属性が無い場合は取得し直す。"""
+        child = _child(101, "PROJ-2", "手順1", "本文1")  # customFields を持たない
+        patcher, mock_client = _mock_client(source_children=[child])
+        full_child = {**child, "customFields": self.CUSTOM_FIELDS}
+        mock_client.get_issue.side_effect = lambda key: (
+            SOURCE_ISSUE if key == "PROJ-1" else full_child
+        )
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        mock_client.get_issue.assert_any_call("PROJ-2")
+        child_params = mock_client.create_issue.call_args_list[1][0][0]
+        self.assertEqual(child_params["customField_11"], [1])
+
+    def test_child_is_not_refetched_when_custom_fields_present(self):
+        child = _child(101, "PROJ-2", "手順1", "本文1")
+        child["customFields"] = []
+        patcher, mock_client = _mock_client(source_children=[child])
+        with patcher, patch("sys.stdout", new_callable=StringIO), tty(), \
+             patch("builtins.input", return_value="y"):
+            sut.run(_make_args(execute=True, date="20260828"), _make_config())
+        self.assertEqual(
+            [c[0][0] for c in mock_client.get_issue.call_args_list], ["PROJ-1"]
+        )
 
     def test_always_creates_in_source_project(self):
         """複製先は常にコピー元と同じプロジェクト。"""
