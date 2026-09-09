@@ -3,6 +3,7 @@ Backlog 課題クローンツール
 ==========================
 指定した課題の description をコピーして新規課題を作成する CLI ツール。
 親課題を指定した場合は、その子課題もまとめて複製する。
+clone.target_issue_key を指定すると、件名で探さずその課題（と子課題）を直接更新する。
 
 使い方:
   python3 backlog_issue_cloner.py                    # ドライラン（デフォルト）
@@ -87,6 +88,9 @@ STATUS_IDS_OPEN = [1, 2, 3]
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
 MATCH_MODES = ("substring", "exact")
+
+# 件名テンプレートの既定値。コピー元の件名をそのまま使う。
+DEFAULT_SUMMARY_TEMPLATE = "{SOURCE_SUMMARY}"
 
 # backlog セクションで受け付ける数値設定と、その最小値
 NUMERIC_SETTINGS = (
@@ -487,8 +491,26 @@ def validate_config(config: dict) -> None:
     src = c.get("source_issue_key", "")
     if not src or src == "PROJ-123":
         raise ConfigError("config.yaml の clone.source_issue_key を設定してください。")
-    if not c.get("summary_template"):
-        raise ConfigError("config.yaml の clone.summary_template を設定してください。")
+    # summary_template は省略可（省略時はコピー元の件名をそのまま使う）。
+    # ただし空文字を指定した場合は件名が空になってしまうため弾く。
+    if "summary_template" in c and not c["summary_template"]:
+        raise ConfigError(
+            "config.yaml の clone.summary_template を空にはできません。"
+            "（省略すればコピー元の件名をそのまま使います）"
+        )
+
+    if "target_issue_key" in c:
+        if not c["target_issue_key"]:
+            raise ConfigError(
+                "config.yaml の clone.target_issue_key を空にはできません。"
+                "（件名で複製先を探す場合はこの項目ごと省略してください）"
+            )
+        if c.get("target_project_key"):
+            raise ConfigError(
+                "config.yaml の clone.target_issue_key と clone.target_project_key は"
+                "同時に指定できません。"
+                "（target_issue_key を指定した場合、複製先はその課題のプロジェクトになります）"
+            )
 
     match_mode = c.get("match_mode", "substring")
     if match_mode not in MATCH_MODES:
@@ -601,15 +623,20 @@ def find_existing_by_summary(
     *,
     match_mode: str = "substring",
     status_ids: list | None = None,
+    exclude_id: int | None = None,
 ) -> dict | None:
     """
     件名が summary にマッチする課題を返す。なければ None。
     keyword 検索は summary + description を対象とするため、件名側でフィルタする。
     match_mode="exact" なら完全一致、"substring" なら部分一致。
     status_ids を渡すとその状態の課題のみを検索対象にする。
+    exclude_id を渡すとその課題を検索結果から除外する。summary_template を
+    省略するとコピー元と同じ件名になり、コピー元自身がヒットしてしまうため。
     検索結果は遅延列挙されるため、最初にマッチした時点で以降のページは取得しない。
     """
     for issue in client.search_issues_by_keyword(project_id, summary, status_ids):
+        if exclude_id is not None and issue.get("id") == exclude_id:
+            continue
         if summary_matches(summary, issue.get("summary", ""), match_mode):
             return issue
     return None
@@ -637,8 +664,12 @@ class ChildPlan:
     existing: dict | None = None  # 複製先に既にある子課題
 
 
-def build_child_summary(template: str, source_summary: str, date_str: str) -> str:
-    """子課題の件名を組み立てる。"""
+def build_summary(template: str, source_summary: str, date_str: str) -> str:
+    """
+    件名テンプレートを展開する。親課題・子課題の双方で使う。
+      {SOURCE_SUMMARY} : コピー元の件名
+      {YYYYMMDD}       : --date または今日の日付
+    """
     return template.replace("{SOURCE_SUMMARY}", source_summary).replace(
         "{YYYYMMDD}", date_str
     )
@@ -660,7 +691,7 @@ def build_child_plans(
     plans = []
     used = set()
     for source in source_children:
-        summary = build_child_summary(template, source.get("summary", ""), date_str)
+        summary = build_summary(template, source.get("summary", ""), date_str)
         match = None
         for i, existing in enumerate(existing_children):
             if i in used:
@@ -785,9 +816,8 @@ def run(args: argparse.Namespace, config: dict) -> str:
     backlog_cfg = config["backlog"]
     clone_cfg = config["clone"]
 
-    # 1. 日付解決 → 件名テンプレート展開
+    # 1. 日付解決（件名テンプレートの展開はコピー元を取得した後）
     date_str = resolve_date(args.date)
-    summary = clone_cfg["summary_template"].replace("{YYYYMMDD}", date_str)
 
     # 2. BacklogClient 初期化
     client = BacklogClient(
@@ -825,26 +855,50 @@ def run(args: argparse.Namespace, config: dict) -> str:
             source_children = list(client.get_child_issues(source_issue["id"]))
             print(f"  子課題: {len(source_children)} 件")
 
-    # 4. 対象プロジェクトのキーと ID を確定
-    # Backlog API の単一課題レスポンスには projectId（数値）のみ含まれ project オブジェクトはない。
-    # コピー元と同じプロジェクトなら issueKey（例: PROJ-123）のプレフィックスをキーとし、
-    # ID は取得済みの source_issue["projectId"] を流用して API 呼び出しを 1 回節約する。
-    override_key = clone_cfg.get("target_project_key")
-    if override_key:
-        target_project_key = override_key
-        print(f"対象プロジェクトを取得中: {target_project_key}")
-        project_id = client.get_project(target_project_key)["id"]
-    else:
-        target_project_key = source_issue["issueKey"].rsplit("-", 1)[0]
-        project_id = source_issue.get("projectId")
-        if project_id is None:
-            print(f"対象プロジェクトを取得中: {target_project_key}")
-            project_id = client.get_project(target_project_key)["id"]
-
-    # 5. 重複検出の条件を確定
+    # 4. 重複検出の条件を確定
     match_mode = clone_cfg.get("match_mode", "substring")
     include_closed = bool(clone_cfg.get("include_closed", False))
     status_ids = None if include_closed else STATUS_IDS_OPEN
+
+    # 5. コピー先を確定する
+    target_issue_key = clone_cfg.get("target_issue_key")
+    if target_issue_key:
+        # 5a. コピー先が明示されている場合は件名で探さず直接取得する
+        print(f"コピー先課題を取得中: {target_issue_key}")
+        existing = client.get_issue(target_issue_key)
+        if existing is None:
+            raise ConfigError(f"コピー先課題「{target_issue_key}」が見つかりません。")
+        if existing.get("id") == source_issue.get("id"):
+            raise ConfigError(
+                f"コピー元とコピー先が同じ課題です: {source_key}"
+            )
+        summary = existing.get("summary", "")  # 件名は変更しない
+        target_project_key = existing["issueKey"].rsplit("-", 1)[0]
+        project_id = existing.get("projectId")
+        if project_id is None:
+            project_id = client.get_project(target_project_key)["id"]
+    else:
+        # 5b. 件名テンプレートを展開して既存課題を探す
+        summary = build_summary(
+            clone_cfg.get("summary_template") or DEFAULT_SUMMARY_TEMPLATE,
+            source_issue.get("summary", ""),
+            date_str,
+        )
+        # Backlog API の単一課題レスポンスには projectId（数値）のみ含まれ
+        # project オブジェクトはない。コピー元と同じプロジェクトなら issueKey
+        #（例: PROJ-123）のプレフィックスをキーとし、ID は取得済みの
+        # source_issue["projectId"] を流用して API 呼び出しを 1 回節約する。
+        override_key = clone_cfg.get("target_project_key")
+        if override_key:
+            target_project_key = override_key
+            print(f"対象プロジェクトを取得中: {target_project_key}")
+            project_id = client.get_project(target_project_key)["id"]
+        else:
+            target_project_key = source_issue["issueKey"].rsplit("-", 1)[0]
+            project_id = source_issue.get("projectId")
+            if project_id is None:
+                print(f"対象プロジェクトを取得中: {target_project_key}")
+                project_id = client.get_project(target_project_key)["id"]
 
     # 6. 解決済み設定値を表示
     # 種別・優先度は新規作成でしか使わないため、ここでは解決しない。
@@ -855,14 +909,23 @@ def run(args: argparse.Namespace, config: dict) -> str:
     print(f"  コピー元    : {source_key}")
     print(f"  対象PJ      : {target_project_key} (id={project_id})")
     print(f"  本文文字数  : {len(source_desc)} 文字")
-    print(f"  重複判定    : {match_mode}"
-          f"（完了済み課題を{'含む' if include_closed else '除く'}）")
+    if target_issue_key:
+        print(f"  コピー先    : {target_issue_key}（件名は変更しません）")
+        print(f"  子課題照合  : {match_mode}")
+    else:
+        print(f"  重複判定    : {match_mode}"
+              f"（完了済み課題を{'含む' if include_closed else '除く'}）")
 
-    # 7. 重複チェック
-    print(f"\n既存課題を検索中（件名: {summary!r}）...")
-    existing = find_existing_by_summary(
-        client, project_id, summary, match_mode=match_mode, status_ids=status_ids
-    )
+    # 7. コピー先が明示されていなければ既存課題を検索する
+    if not target_issue_key:
+        print(f"\n既存課題を検索中（件名: {summary!r}）...")
+        existing = find_existing_by_summary(
+            client, project_id, summary,
+            match_mode=match_mode,
+            status_ids=status_ids,
+            # 件名テンプレート省略時はコピー元と同じ件名になるため自分自身を除く
+            exclude_id=source_issue.get("id"),
+        )
 
     # 8. 親課題の操作を決める
     if existing is None:

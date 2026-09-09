@@ -129,6 +129,26 @@ class TestFindExistingBySummary(unittest.TestCase):
 
     # --- status_ids ---
 
+    def test_exclude_id_skips_that_issue(self):
+        """summary_template 省略時にコピー元自身がヒットしないことを保証する。"""
+        issues = [
+            {"id": 1, "issueKey": "PROJ-1", "summary": "テンプレート課題"},
+            {"id": 2, "issueKey": "PROJ-9", "summary": "テンプレート課題"},
+        ]
+        client = self._make_client(issues)
+        result = sut.find_existing_by_summary(
+            client, 10, "テンプレート課題", exclude_id=1
+        )
+        self.assertEqual(result["issueKey"], "PROJ-9")
+
+    def test_exclude_id_returns_none_when_only_self_matches(self):
+        issues = [{"id": 1, "issueKey": "PROJ-1", "summary": "テンプレート課題"}]
+        client = self._make_client(issues)
+        result = sut.find_existing_by_summary(
+            client, 10, "テンプレート課題", exclude_id=1
+        )
+        self.assertIsNone(result)
+
     def test_status_ids_passed_through(self):
         client = self._make_client([])
         sut.find_existing_by_summary(
@@ -614,21 +634,21 @@ class TestResolvePriorityId(unittest.TestCase):
 # ===========================================================================
 
 
-class TestBuildChildSummary(unittest.TestCase):
+class TestBuildSummary(unittest.TestCase):
     def test_default_template_keeps_source_summary(self):
         self.assertEqual(
-            sut.build_child_summary("{SOURCE_SUMMARY}", "手順1 バックアップ", "20260828"),
+            sut.build_summary("{SOURCE_SUMMARY}", "手順1 バックアップ", "20260828"),
             "手順1 バックアップ",
         )
 
     def test_date_placeholder(self):
         self.assertEqual(
-            sut.build_child_summary("{YYYYMMDD} {SOURCE_SUMMARY}", "点検", "20260828"),
+            sut.build_summary("{YYYYMMDD} {SOURCE_SUMMARY}", "点検", "20260828"),
             "20260828 点検",
         )
 
     def test_static_template(self):
-        self.assertEqual(sut.build_child_summary("固定", "元", "20260828"), "固定")
+        self.assertEqual(sut.build_summary("固定", "元", "20260828"), "固定")
 
 
 class TestBuildChildPlans(unittest.TestCase):
@@ -859,6 +879,7 @@ def _make_config(
     priority=None,
     match_mode=None,
     include_closed=None,
+    target_issue_key=None,
 ):
     cfg = {
         "backlog": {
@@ -882,6 +903,10 @@ def _make_config(
         cfg["clone"]["match_mode"] = match_mode
     if include_closed is not None:
         cfg["clone"]["include_closed"] = include_closed
+    if summary_template is None:
+        del cfg["clone"]["summary_template"]
+    if target_issue_key:
+        cfg["clone"]["target_issue_key"] = target_issue_key
     return cfg
 
 
@@ -1257,6 +1282,33 @@ class TestValidateConfig(unittest.TestCase):
         with self.assertRaises(sut.ConfigError):
             sut.validate_config(cfg)
 
+    def test_omitted_summary_template_passes(self):
+        """省略時はコピー元の件名をそのまま使うため必須ではない。"""
+        cfg = self._base_config()
+        del cfg["clone"]["summary_template"]
+        sut.validate_config(cfg)
+
+    # --- target_issue_key ---
+
+    def test_target_issue_key_passes(self):
+        cfg = self._base_config()
+        cfg["clone"]["target_issue_key"] = "DEST-5"
+        sut.validate_config(cfg)
+
+    def test_empty_target_issue_key_raises(self):
+        cfg = self._base_config()
+        cfg["clone"]["target_issue_key"] = ""
+        with self.assertRaises(sut.ConfigError):
+            sut.validate_config(cfg)
+
+    def test_target_issue_key_with_project_key_raises(self):
+        cfg = self._base_config()
+        cfg["clone"]["target_issue_key"] = "DEST-5"
+        cfg["clone"]["target_project_key"] = "DEST"
+        with self.assertRaises(sut.ConfigError) as ctx:
+            sut.validate_config(cfg)
+        self.assertIn("同時に指定できません", str(ctx.exception))
+
     def test_invalid_match_mode_raises(self):
         cfg = self._base_config()
         cfg["clone"]["match_mode"] = "regex"
@@ -1589,6 +1641,177 @@ class TestRunWithChildren(unittest.TestCase):
         """コピー元に子が無ければ既存の親の子課題も引きに行かない。"""
         _, mc, _ = self._run(existing=EXISTING_DIFF, source_children=[])
         mc.get_child_issues.assert_called_once_with(SOURCE_ISSUE["id"])
+
+
+class TestRunWithoutSummaryTemplate(unittest.TestCase):
+    """summary_template 省略時はコピー元の件名をそのまま使う。"""
+
+    def _run(self, *, search_results=None, config=None, answer="y"):
+        patcher, mc = _mock_client()
+        if search_results is not None:
+            mc.search_issues_by_keyword.return_value = search_results
+        out = StringIO()
+        with patcher, patch("sys.stdout", out), patch("sys.stderr", new_callable=StringIO), \
+             tty(), patch("builtins.input", return_value=answer):
+            outcome = sut.run(
+                _make_args(execute=True, date="20260828"),
+                config or _make_config(summary_template=None),
+            )
+        return outcome, mc, out.getvalue()
+
+    def test_uses_source_summary_as_is(self):
+        outcome, mc, _ = self._run(search_results=[])
+        self.assertEqual(outcome, sut.OUTCOME_CREATED)
+        params = mc.create_issue.call_args[0][0]
+        self.assertEqual(params["summary"], SOURCE_ISSUE["summary"])
+
+    def test_source_issue_itself_is_not_treated_as_existing(self):
+        """コピー元と同じ件名になるため、コピー元自身を既存扱いしない。"""
+        outcome, mc, _ = self._run(search_results=[SOURCE_ISSUE])
+        self.assertEqual(outcome, sut.OUTCOME_CREATED)
+        mc.create_issue.assert_called_once()
+        mc.update_issue.assert_not_called()
+
+    def test_other_issue_with_same_summary_is_updated(self):
+        other = {
+            "id": 2002,
+            "issueKey": "PROJ-50",
+            "summary": SOURCE_ISSUE["summary"],
+            "description": "古い本文",
+        }
+        outcome, mc, _ = self._run(search_results=[SOURCE_ISSUE, other])
+        self.assertEqual(outcome, sut.OUTCOME_UPDATED)
+        mc.update_issue.assert_called_once_with("PROJ-50", {"description": "本文テキスト"})
+
+    def test_explicit_template_still_works(self):
+        outcome, mc, _ = self._run(search_results=[], config=_make_config())
+        params = mc.create_issue.call_args[0][0]
+        self.assertEqual(params["summary"], "【定期】20260828 タスク")
+
+    def test_template_can_combine_source_summary_and_date(self):
+        cfg = _make_config(summary_template="{YYYYMMDD} {SOURCE_SUMMARY}")
+        _, mc, _ = self._run(search_results=[], config=cfg)
+        params = mc.create_issue.call_args[0][0]
+        self.assertEqual(params["summary"], "20260828 テンプレート課題")
+
+
+class TestRunWithTargetIssueKey(unittest.TestCase):
+    """target_issue_key で複製先を明示する経路。"""
+
+    TARGET = {
+        "id": 3001,
+        "issueKey": "DEST-5",
+        "summary": "複製先の件名",
+        "description": "古い本文",
+        "projectId": 77,
+    }
+    SOURCE_CHILDREN = [
+        _child(101, "PROJ-2", "手順1 バックアップ", "本文1"),
+        _child(102, "PROJ-3", "手順2 検証", "本文2"),
+    ]
+
+    def _run(self, *, target=None, source_children=None, existing_children=None,
+             config=None, execute=True, answer="y"):
+        patcher, mc = _mock_client(
+            source_children=source_children, existing_children=existing_children
+        )
+        target = self.TARGET if target is None else target
+        mc.get_issue.side_effect = lambda key: (
+            SOURCE_ISSUE if key == "PROJ-1" else target
+        )
+        out = StringIO()
+        with patcher, patch("sys.stdout", out), patch("sys.stderr", new_callable=StringIO), \
+             tty(), patch("builtins.input", return_value=answer):
+            outcome = sut.run(
+                _make_args(execute=execute, date="20260828"),
+                config or _make_config(target_issue_key="DEST-5"),
+            )
+        return outcome, mc, out.getvalue()
+
+    def test_updates_target_without_searching(self):
+        outcome, mc, _ = self._run()
+        self.assertEqual(outcome, sut.OUTCOME_UPDATED)
+        mc.search_issues_by_keyword.assert_not_called()
+        mc.update_issue.assert_called_once_with("DEST-5", {"description": "本文テキスト"})
+
+    def test_summary_is_not_changed(self):
+        _, mc, out = self._run()
+        params = mc.update_issue.call_args[0][1]
+        self.assertNotIn("summary", params)
+        self.assertIn("件名は変更しません", out)
+
+    def test_no_change_when_description_matches(self):
+        target = {**self.TARGET, "description": "本文テキスト"}
+        outcome, mc, _ = self._run(target=target)
+        self.assertEqual(outcome, sut.OUTCOME_NO_CHANGE)
+        mc.update_issue.assert_not_called()
+
+    def test_children_are_updated_one_by_one(self):
+        existing_children = [
+            _child(901, "DEST-6", "手順1 バックアップ", "本文1"),   # 同一
+            _child(902, "DEST-7", "手順2 検証", "古い本文"),        # 差分
+        ]
+        outcome, mc, _ = self._run(
+            source_children=self.SOURCE_CHILDREN, existing_children=existing_children
+        )
+        self.assertEqual(outcome, sut.OUTCOME_UPDATED)
+        self.assertEqual(
+            [c[0][0] for c in mc.update_issue.call_args_list], ["DEST-5", "DEST-7"]
+        )
+        mc.create_issue.assert_not_called()
+
+    def test_missing_child_is_created_under_target(self):
+        existing_children = [_child(901, "DEST-6", "手順1 バックアップ", "本文1")]
+        outcome, mc, _ = self._run(
+            source_children=self.SOURCE_CHILDREN, existing_children=existing_children
+        )
+        self.assertEqual(outcome, sut.OUTCOME_CREATED)
+        params = mc.create_issue.call_args[0][0]
+        self.assertEqual(params["summary"], "手順2 検証")
+        self.assertEqual(params["parentIssueId"], self.TARGET["id"])
+        self.assertEqual(params["projectId"], self.TARGET["projectId"])
+
+    def test_children_looked_up_on_source_then_target(self):
+        _, mc, _ = self._run(source_children=self.SOURCE_CHILDREN, existing_children=[])
+        called_ids = [c[0][0] for c in mc.get_child_issues.call_args_list]
+        self.assertEqual(called_ids, [SOURCE_ISSUE["id"], self.TARGET["id"]])
+
+    def test_missing_target_raises_config_error(self):
+        patcher, mc = _mock_client()
+        mc.get_issue.side_effect = lambda key: SOURCE_ISSUE if key == "PROJ-1" else None
+        with patcher, patch("sys.stdout", new_callable=StringIO):
+            with self.assertRaises(sut.ConfigError) as ctx:
+                sut.run(
+                    _make_args(execute=True, date="20260828"),
+                    _make_config(target_issue_key="DEST-999"),
+                )
+        self.assertIn("コピー先課題", str(ctx.exception))
+
+    def test_same_source_and_target_raises_config_error(self):
+        patcher, mc = _mock_client()
+        mc.get_issue.side_effect = lambda key: SOURCE_ISSUE
+        with patcher, patch("sys.stdout", new_callable=StringIO):
+            with self.assertRaises(sut.ConfigError) as ctx:
+                sut.run(
+                    _make_args(execute=True, date="20260828"),
+                    _make_config(target_issue_key="PROJ-1"),
+                )
+        self.assertIn("同じ課題", str(ctx.exception))
+
+    def test_dry_run_changes_nothing(self):
+        outcome, mc, _ = self._run(execute=False)
+        self.assertEqual(outcome, sut.OUTCOME_UPDATED)
+        mc.update_issue.assert_not_called()
+
+    def test_project_id_fetched_when_absent_on_target(self):
+        target = {k: v for k, v in self.TARGET.items() if k != "projectId"}
+        _, mc, _ = self._run(target=target)
+        mc.get_project.assert_called_once_with("DEST")
+
+    def test_cancel_skips(self):
+        outcome, mc, _ = self._run(answer="n")
+        self.assertEqual(outcome, sut.OUTCOME_SKIPPED)
+        mc.update_issue.assert_not_called()
 
 
 # ===========================================================================
