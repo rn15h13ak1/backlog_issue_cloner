@@ -1294,7 +1294,7 @@ def run(args: argparse.Namespace, config: dict) -> str:
             **configured_fields,
         })
         parent_id = created["id"]
-        print(f"作成完了: {created['issueKey']} — {created['summary']}")
+        print(f"作成完了: {created['issueKey']} ― {created['summary']}")
     else:
         parent_id = existing["id"]
         if parent_action == OUTCOME_UPDATED:
@@ -1302,11 +1302,11 @@ def run(args: argparse.Namespace, config: dict) -> str:
                 updated = client.update_issue(
                     existing["issueKey"], {"description": source_desc}
                 )
-                print(f"更新完了: {updated['issueKey']} — {updated['summary']}")
+                print(f"更新完了: {updated['issueKey']} ― {updated['summary']}")
             except BacklogNoChangeError as e:
                 # Backlog はバリデーションエラーにも同じコードを返すため、
                 # サーバのメッセージを併記して取り違えに気付けるようにする
-                print(f"スキップ（変更なしと判断）: {existing['issueKey']} — {e}")
+                print(f"スキップ（変更なしと判断）: {existing['issueKey']} ― {e}")
                 parent_action = OUTCOME_NO_CHANGE
 
     # 13. 子課題を作成・更新する
@@ -1350,10 +1350,10 @@ def _apply_child_plan(
             )
         except BacklogNoChangeError as e:
             print(
-                f"  [子] スキップ（変更なしと判断）: {plan.existing['issueKey']} — {e}"
+                f"  [子] スキップ（変更なしと判断）: {plan.existing['issueKey']} ― {e}"
             )
             return OUTCOME_NO_CHANGE
-        print(f"  [子] 更新完了: {updated['issueKey']} — {updated['summary']}")
+        print(f"  [子] 更新完了: {updated['issueKey']} ― {updated['summary']}")
         return OUTCOME_UPDATED
 
     # 種別はコピー元の子課題に合わせ、優先度は Backlog 共通のため ID をそのまま使う
@@ -1382,7 +1382,7 @@ def _apply_child_plan(
         "parentIssueId": parent_id,
         **extra,
     })
-    print(f"  [子] 作成完了: {created['issueKey']} — {created['summary']}")
+    print(f"  [子] 作成完了: {created['issueKey']} ― {created['summary']}")
     return OUTCOME_CREATED
 
 
@@ -1404,7 +1404,7 @@ def show_source_issue(args: argparse.Namespace, config: dict) -> None:
     if issue is None:
         raise ConfigError(f"コピー元課題「{source_key}」が見つかりません。")
 
-    print(f"コピー元課題: {issue['issueKey']} — {issue.get('summary', '')}")
+    print(f"コピー元課題: {issue['issueKey']} ― {issue.get('summary', '')}")
     print(f"  種別: {(issue.get('issueType') or {}).get('name', '（不明）')}"
           "  ← 設定で指定しない限り、この種別で作成します")
     fields = issue.get("customFields")

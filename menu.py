@@ -21,7 +21,17 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
-import backlog_issue_cloner as cloner
+try:
+    import backlog_issue_cloner as cloner
+except ModuleNotFoundError as e:
+    # menu.bat のダブルクリック起動で、依存が入っていない場合に
+    # トレースバックではなく対処を表示する
+    if e.name != "yaml":
+        raise
+    print("必要なライブラリ PyYAML が入っていません。")
+    print("次のコマンドでインストールしてください:")
+    print("    pip install pyyaml")
+    sys.exit(2)
 
 WIDTH = 60
 TOOL_DIR = Path(__file__).resolve().parent
@@ -352,7 +362,7 @@ def main() -> None:
         (i for i, (key, _, _) in enumerate(MODES, 1) if key == last_mode), None
     )
 
-    items = [f"{label} — {desc}" for _, label, desc in MODES]
+    items = [f"{label} ― {desc}" for _, label, desc in MODES]
 
     try:
         while True:
