@@ -2,7 +2,8 @@
 ドキュメントと実装の整合を検査する
 ====================================
 設定項目・コマンドラインオプション・終了コードが、実装と README と
-config.sample.yaml で一致しているかを確認する。リンク切れも検出する。
+config.sample.yaml で一致しているかを確認する。リンク切れと、
+md の体裁（強調の両端の半角スペース・罫線行の前の空行）も検査する。
 
     python3 tools/check_docs.py
 
@@ -77,6 +78,50 @@ def anchors(markdown: str) -> set:
     }
 
 
+MARKDOWN_FILES = ("README.md", "docs/DESIGN.md", "docs/EXAMPLES.md")
+
+# 強調記法。インラインコードを跨ぐ場合があるので、コードを退避してから当てる。
+BOLD_RE = re.compile(r"(?<![*\\])\*\*(\S(?:.*?\S)?)\*\*(?!\*)")
+
+
+def body_lines(markdown: str):
+    """コードフェンスの外の行を (行番号, 本文) で返す。"""
+    fence = False
+    for number, line in enumerate(markdown.splitlines(), 1):
+        if line.lstrip().startswith("```"):
+            fence = not fence
+            continue
+        if not fence:
+            yield number, line
+
+
+def check_markdown_style(problems: list) -> None:
+    """md の体裁を検査する。プレビューの崩れと表記ゆれを防ぐ。"""
+    for name in MARKDOWN_FILES:
+        text = read(name)
+
+        # ** の両端は半角スペース（行頭・行末は除く）
+        for number, line in body_lines(text):
+            masked = re.sub(r"`[^`]*`", lambda m: "\x00" * len(m.group(0)), line)
+            for m in BOLD_RE.finditer(masked):
+                before = line[m.start() - 1] if m.start() else ""
+                after = line[m.end()] if m.end() < len(line) else ""
+                if (before and before != " ") or (after and after != " "):
+                    problems.append(
+                        f"{name}:{number} ** の両端は半角スペースにしてください: "
+                        f"...{line[max(0, m.start() - 4):m.end() + 4]}..."
+                    )
+
+        # ``` の直後に罫線だけの行があるとプレビューが崩れる
+        lines = text.splitlines()
+        for i in range(len(lines) - 1):
+            if (lines[i].lstrip().startswith("```")
+                    and re.match(r"^\s*[=\-]{3,}\s*$", lines[i + 1])):
+                problems.append(
+                    f"{name}:{i + 1} ``` の直後の罫線行との間に空行を入れてください"
+                )
+
+
 def check() -> list:
     """不一致の説明を並べて返す。空なら問題なし。"""
     problems = []
@@ -129,7 +174,10 @@ def check() -> list:
             if not (base / rel).exists():
                 problems.append(f"{name} のリンク {rel} のファイルがありません")
 
-    # 6. 仕様書が挙げる関数が実在するか
+    # 6. md の体裁（強調のスペース・罫線行の前の空行）
+    check_markdown_style(problems)
+
+    # 7. 仕様書が挙げる関数が実在するか
     for func in sorted(set(re.findall(r"`(\w+)\(\)`", design))):
         if func not in src and func not in menu_src:
             problems.append(f"docs/DESIGN.md が挙げる {func}() が実装にありません")
