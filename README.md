@@ -44,6 +44,7 @@ Backlog の課題を、 **子課題ごとまとめて複製する** CLI ツー�
 **開発者向け**
 18. [設計方針](#設計方針)
 19. [テスト](#テスト)
+20. [変更履歴](#変更履歴)
 
 ---
 
@@ -568,6 +569,7 @@ backlog_issue_cloner/
 ├── menu.py                   対話メニュー（本体を subprocess で呼ぶ）
 ├── menu.bat                  メニューの起動用（Windows でダブルクリック）
 ├── config.sample.yaml        設定ファイルのテンプレート
+├── CHANGELOG.md              変更履歴
 ├── config.yaml               実際の設定。API キーを含むため Git 管理外
 ├── .gitattributes            menu.bat の改行コードを CRLF に固定
 ├── docs/
@@ -651,3 +653,10 @@ python3 tools/mutation_test.py               # テストが退行を検知でき
 どちらも問題があれば Exit code `1` を返します。
 
 メニューの対話ループ本体（`main`）は副作用が大きいため対象外にしています。
+
+---
+
+## 変更履歴
+
+[CHANGELOG.md](CHANGELOG.md) を参照。バージョンはコミット履歴からさかのぼって
+付けたもので、タグは打っていません。

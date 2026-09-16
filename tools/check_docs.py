@@ -78,7 +78,8 @@ def anchors(markdown: str) -> set:
     }
 
 
-MARKDOWN_FILES = ("README.md", "docs/DESIGN.md", "docs/EXAMPLES.md")
+MARKDOWN_FILES = ("README.md", "CHANGELOG.md",
+                  "docs/DESIGN.md", "docs/EXAMPLES.md")
 
 # 強調記法。インラインコードを跨ぐ場合があるので、コードを退避してから当てる。
 BOLD_RE = re.compile(r"(?<![*\\])\*\*(\S(?:.*?\S)?)\*\*(?!\*)")

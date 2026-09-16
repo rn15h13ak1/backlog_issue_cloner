@@ -35,6 +35,7 @@ menu.bat                  Windows でメニューをダブルクリック起動�
 tools/                    保守用スクリプト（ドキュメント検査・ミューテーションテスト）
 docs/DESIGN.md            この文書
 README.md                 利用者向けドキュメント
+CHANGELOG.md              変更履歴
 ```
 
 ### 依存の向き
