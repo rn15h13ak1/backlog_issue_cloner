@@ -1,6 +1,35 @@
+# OS / エディタ
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/
+*.swp
+*~
+
+# mac-watcher トリガー・ログ
+.build-trigger
+.build-output.log
+.git-trigger
+.git-output.log
+.github-trigger
+
+# 資格情報
+.env
+.env.*
+secrets.yaml
+credentials*
+*.pem
+*.key
+*.local.yaml
+
+# 本ツールの設定の実体（Backlog の API キーを書くため）
 config.yaml
+
+# Python
 __pycache__/
 *.py[cod]
-.DS_Store
+
+# テストのカバレッジ
 .coverage
 htmlcov/
