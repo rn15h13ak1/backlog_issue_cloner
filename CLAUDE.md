@@ -23,23 +23,6 @@ python3 tools/check_docs.py
 python3 -m unittest discover -s tests -t .
 ```
 
-### check-privacy.sh の 2 件は誤検知として許容する
-
-`check-privacy.sh` は次の 2 件を「資格情報らしき値」として報告し、
-「コミットしないでください」と出力するが、**いずれもプレースホルダであり実際の鍵ではない。**
-
-| 箇所 | 内容 |
-| --- | --- |
-| `README.md` の設定例 | `api_key` に利用者へ入力を促すプレースホルダを書いている |
-| `config.sample.yaml` | 同上 |
-
-（本節に実際の文字列を書き写すと、この検査の指摘が 2 件増えてしまうため書かない。）
-
-実鍵を書く `config.yaml` は `.gitignore` で除外済みで、Git の追跡対象に入っていない。
-
-**この 2 件が出ている状態でもコミットする。** ただし報告が常態化すると本物の混入を
-見逃すため、`check-privacy.sh` 側でプレースホルダを除外する改修を
-[../proposals/ws-conventions-privacy-placeholder.md](../proposals/ws-conventions-privacy-placeholder.md) に提案している。
-これが取り込まれたら本節は削除する。
-
-**新たな指摘が出た場合は誤検知と決めつけず、内容を確認すること。**
+**4 つとも指摘 0 件でなければコミットしない。** 既知の誤検知は残っていない
+（`check-privacy.sh` がプレースホルダを資格情報と誤認していた件は、2026-09-20 に
+ws-conventions 側で解消済み）。指摘が出たら内容を確認して直すこと。
