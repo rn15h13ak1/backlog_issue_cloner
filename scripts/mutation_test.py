@@ -1,10 +1,11 @@
+#!/usr/bin/env python3
 """
 テストが退行を検知できるかを測る（ミューテーションテスト）
 ==========================================================
 実装にわざとバグを埋め込み、テストが落ちるかを確認する。
 
-    python3 tools/mutation_test.py            # 全件実行
-    python3 tools/mutation_test.py --list     # 変異の一覧だけ表示
+    python3 scripts/mutation_test.py            # 全件実行
+    python3 scripts/mutation_test.py --list     # 変異の一覧だけ表示
 
 見逃しが 1 件でもあれば終了コード 1 を返す。
 

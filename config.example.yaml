@@ -4,7 +4,7 @@
 # このファイルをコピーして config.yaml を作成してください。
 # config.yaml は .gitignore で除外されています（API キーを含むため）。
 #
-#   cp config.sample.yaml config.yaml
+#   cp config.example.yaml config.yaml
 #
 # 依存ライブラリのインストール:
 #   pip3 install pyyaml

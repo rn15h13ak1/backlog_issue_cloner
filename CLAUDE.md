@@ -20,13 +20,20 @@
 ../ws-conventions/bin/check-markdown.sh .
 ../ws-conventions/bin/check-privacy.sh .
 ../ws-conventions/bin/check-commands.sh .
-python3 tools/check_docs.py
+python3 scripts/check_docs.py
 python3 -m unittest discover -s tests -t .
 ```
 
 **5 つとも指摘 0 件でなければコミットしない。** 既知の誤検知は残っていない
 （`check-privacy.sh` がプレースホルダを資格情報と誤認していた件は、2026-09-20 に
 ws-conventions 側で解消済み）。指摘が出たら内容を確認して直すこと。
+
+実装（`backlog_issue_cloner.py` ・ `menu.py`）に手を入れたときは、
+テストが退行を検知できるかも測る。
+
+```bash
+python3 scripts/mutation_test.py
+```
 
 **`check-terms.sh` と `gen-decision-index.py` は、本リポジトリでは使わない。**
 どちらも ADR を使うリポジトリ向けで、本リポジトリは ADR を置いていない。

@@ -8,6 +8,12 @@
 ## [Unreleased]
 
 ### Changed
+- 保守用スクリプトの置き場を `tools/` から `scripts/` に変えた。共通規約の記載漏れ検査
+  （`check-commands.sh`）が `scripts/` と `bin/` しか見ないため、`tools/` のままでは
+  **検査の対象外だった。** 移した直後に `mutation_test.py` の記載漏れが見つかっている。
+  あわせてシェバンを付け、実行権を与えた
+- 設定のテンプレートを `config.sample.yaml` から `config.example.yaml` に改名した。
+  共通規約が `*.example.*` を定型としているため
 - `.gitignore` を共通規約の定型に揃えた。`.env` ・ `credentials*` ・ `*.pem` ・ `*.key` などの
   資格情報の型と、`.claude/` ・ エディタの作業ファイルが抜けていた。`config.yaml` の除外は
   従来どおり

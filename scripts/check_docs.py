@@ -1,11 +1,12 @@
+#!/usr/bin/env python3
 """
 ドキュメントと実装の整合を検査する
 ====================================
 設定項目・コマンドラインオプション・終了コードが、実装と README と
-config.sample.yaml で一致しているかを確認する。リンク切れと、
+config.example.yaml で一致しているかを確認する。リンク切れと、
 md の体裁（強調の両端の半角スペース・罫線行の前の空行）も検査する。
 
-    python3 tools/check_docs.py
+    python3 scripts/check_docs.py
 
 不一致があれば内容を表示して終了コード 1 を返す。
 
@@ -181,7 +182,7 @@ def check() -> list:
     src = read("backlog_issue_cloner.py")
     menu_src = read("menu.py")
     readme = read("README.md")
-    sample = read("config.sample.yaml")
+    sample = read("config.example.yaml")
     design = read("docs/DESIGN.md")
 
     # 1. 設定項目
@@ -194,7 +195,7 @@ def check() -> list:
         for key in sorted(doc - code):
             problems.append(f"README の表にある {section}.{key} を実装が読んでいません")
         for key in sorted(code - sample_keys):
-            problems.append(f"設定 {section}.{key} が config.sample.yaml にありません")
+            problems.append(f"設定 {section}.{key} が config.example.yaml にありません")
 
     # 2. 廃止した設定項目が使えるものとして書かれていないか
     for key in DEPRECATED_KEYS:

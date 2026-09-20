@@ -68,7 +68,7 @@ python3 menu.py
 
 ```bash
 # 1. 接続情報だけ設定する
-cp config.sample.yaml config.yaml
+cp config.example.yaml config.yaml
 
 # 2. まずドライランで確認（既定。何も書き換えない）
 python3 backlog_issue_cloner.py --source-issue-key PROJ-10
@@ -401,7 +401,7 @@ esac
 ## 設定ファイル
 
 ```bash
-cp config.sample.yaml config.yaml
+cp config.example.yaml config.yaml
 ```
 
 ### `backlog` セクション
@@ -568,14 +568,14 @@ backlog_issue_cloner/
 ├── backlog_issue_cloner.py   本体（API クライアント + 複製ロジック + CLI）
 ├── menu.py                   対話メニュー（本体を subprocess で呼ぶ）
 ├── menu.bat                  メニューの起動用（Windows でダブルクリック）
-├── config.sample.yaml        設定ファイルのテンプレート
+├── config.example.yaml       設定ファイルのテンプレート
 ├── CHANGELOG.md              変更履歴
 ├── config.yaml               実際の設定。API キーを含むため Git 管理外
 ├── .gitattributes            menu.bat の改行コードを CRLF に固定
 ├── docs/
 │   ├── DESIGN.md             設計仕様書（保守する人向け）
 │   └── EXAMPLES.md           3 つのモードの実行例
-├── tools/
+├── scripts/
 │   ├── check_docs.py         ドキュメントと実装の整合を検査する
 │   └── mutation_test.py      テストが退行を検知できるかを測る
 └── tests/
@@ -643,12 +643,12 @@ python3 -m coverage report -m
 
 ```bash
 python3 -m unittest discover -s tests -t .   # テスト
-python3 tools/check_docs.py                  # ドキュメントとの整合
-python3 tools/mutation_test.py               # テストが退行を検知できるか
+python3 scripts/check_docs.py                  # ドキュメントとの整合
+python3 scripts/mutation_test.py               # テストが退行を検知できるか
 ```
 
 `check_docs.py` は設定項目・CLI オプション・Exit code が実装と README と
-`config.sample.yaml` で一致しているか、リンクが切れていないか（他ファイルの
+`config.example.yaml` で一致しているか、リンクが切れていないか（他ファイルの
 見出しアンカーを含む）を確認します。
 `mutation_test.py` は実装にわざとバグを埋め込み、テストが落ちるかを確認します。
 どちらも問題があれば Exit code `1` を返します。

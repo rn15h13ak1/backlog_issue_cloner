@@ -582,7 +582,7 @@ def _require_section(config: dict, name: str) -> dict:
     if section is None:
         raise ConfigError(
             f"config.yaml に {name}: セクションがありません。"
-            "config.sample.yaml を参考に記述してください。"
+            "config.example.yaml を参考に記述してください。"
         )
     if not isinstance(section, dict):
         raise ConfigError(
@@ -624,7 +624,7 @@ def validate_config(config: dict) -> None:
     if not isinstance(config, dict):
         raise ConfigError(
             "設定ファイルの内容が空か、形式が不正です。"
-            "config.sample.yaml を参考に記述してください。"
+            "config.example.yaml を参考に記述してください。"
         )
 
     b = _require_section(config, "backlog")

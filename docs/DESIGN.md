@@ -29,10 +29,10 @@
 ```
 backlog_issue_cloner.py   本体（API クライアント + 複製ロジック + CLI）
 menu.py                   対話メニュー
-config.sample.yaml        設定ファイルのひな形
+config.example.yaml       設定ファイルのひな形
 tests/                    ユニットテスト
 menu.bat                  Windows でメニューをダブルクリック起動する
-tools/                    保守用スクリプト（ドキュメント検査・ミューテーションテスト）
+scripts/                  保守用スクリプト（ドキュメント検査・ミューテーションテスト）
 docs/DESIGN.md            この文書
 README.md                 利用者向けドキュメント
 CHANGELOG.md              変更履歴
@@ -292,13 +292,13 @@ Backlog は HTTP 400 のエラーコード 7 を、
 
 ```bash
 python3 -m unittest discover -s tests -t .   # テスト
-python3 tools/check_docs.py                  # ドキュメントとの整合
-python3 tools/mutation_test.py               # テストが退行を検知できるか
+python3 scripts/check_docs.py                  # ドキュメントとの整合
+python3 scripts/mutation_test.py               # テストが退行を検知できるか
 ```
 
 ### md を書くときの体裁
 
-`tools/check_docs.py` が次の 3 つを検査します。
+`scripts/check_docs.py` が次の 3 つを検査します。
 
 - **`**` による強調の両端は半角スペース。** 句読点や括弧に隣接する場合も入れます。
   日本語文字に直接隣接すると、環境によって強調が描画されないためです。
@@ -319,9 +319,9 @@ python3 tools/mutation_test.py               # テストが退行を検知でき
 
 1. `run()` で読む
 2. `validate_config()` で型・値を検証する（ **黙って無視しない** ）
-3. `config.sample.yaml` にコメント付きで追加
+3. `config.example.yaml` にコメント付きで追加
 4. README の設定項目表に追加
-5. `python3 tools/check_docs.py` で実装・README・サンプルの一致を確認
+5. `python3 scripts/check_docs.py` で実装・README・サンプルの一致を確認
 
 ### 動作モードを増やす
 
@@ -351,14 +351,14 @@ python3 -m unittest discover -s tests -t .
 実装にわざとバグを埋め込んでテストが落ちるかを測る **ミューテーションテスト** で確認しています。
 
 ```bash
-python3 tools/mutation_test.py
+python3 scripts/mutation_test.py
 ```
 
 過去に実際に起きた不具合（種別を引き継がない、子課題を並べ替えない、
 更新系で 5xx を再試行する、など）を含む変異を全件検知しています。
 `【再現】` が付いた変異が実際の不具合に対応します。
 
-**不具合を直したら、その不具合を再現する変異を `tools/mutation_test.py` に追加してください。**
+**不具合を直したら、その不具合を再現する変異を `scripts/mutation_test.py` に追加してください。**
 同じ退行が二度と通らなくなります。
 
 ### 対象外
