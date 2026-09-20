@@ -340,7 +340,7 @@ python3 tools/mutation_test.py               # テストが退行を検知でき
 python3 -m unittest discover -s tests -t .
 ```
 
-カバレッジは本体・`menu.py` とも branch カバレッジ込みで測っています（[README](../README.md#開発)）。
+カバレッジは本体・`menu.py` とも branch カバレッジ込みで測っています（[README](../README.md#テスト)）。
 
 ### 何を守っているか
 

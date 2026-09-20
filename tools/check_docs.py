@@ -96,6 +96,58 @@ def body_lines(markdown: str):
             yield number, line
 
 
+LINK_RE = re.compile(r"\]\((?!https?:|mailto:)([^)\s]+)\)")
+
+
+def check_links(problems: list) -> None:
+    """
+    md のリンクを検査する。
+
+    同じファイル内のアンカー（`#見出し`）だけでなく、他ファイルのアンカー
+    （`../README.md#見出し`）も見る。飛び先の見出しが無くてもリンクは押せて
+    しまい、ファイルの先頭に着くだけなので気づきにくい。
+    """
+    anchor_cache = {}
+
+    def anchors_of(path: Path) -> set | None:
+        """md ファイルの見出しアンカー。md でない・読めない場合は None。"""
+        if path not in anchor_cache:
+            if path.suffix.lower() != ".md" or not path.is_file():
+                anchor_cache[path] = None
+            else:
+                anchor_cache[path] = anchors(path.read_text(encoding="utf-8"))
+        return anchor_cache[path]
+
+    for name in MARKDOWN_FILES:
+        source = ROOT / name
+        text = read(name)
+        own = anchors(text)
+
+        for link in LINK_RE.findall(text):
+            target, _, fragment = link.partition("#")
+
+            if not target:                      # 同じファイル内のアンカー
+                if fragment not in own:
+                    problems.append(
+                        f"{name} のリンク #{fragment} に対応する見出しがありません"
+                    )
+                continue
+
+            path = (source.parent / target).resolve()
+            if not path.exists():
+                problems.append(f"{name} のリンク {target} のファイルがありません")
+                continue
+
+            if not fragment:
+                continue
+            found = anchors_of(path)
+            if found is not None and fragment not in found:
+                problems.append(
+                    f"{name} のリンク {link} に対応する見出しが"
+                    f" {target} にありません"
+                )
+
+
 def check_markdown_style(problems: list) -> None:
     """md の体裁を検査する。プレビューの崩れと表記ゆれを防ぐ。"""
     for name in MARKDOWN_FILES:
@@ -166,14 +218,7 @@ def check() -> list:
             problems.append(f"終了コード {code}（{name}）が README の表にありません")
 
     # 5. リンクとアンカー
-    for name, text in (("README.md", readme), ("docs/DESIGN.md", design)):
-        found = anchors(text)
-        for anchor in sorted(set(re.findall(r"\]\(#([^)]+)\)", text)) - found):
-            problems.append(f"{name} のリンク #{anchor} に対応する見出しがありません")
-        base = (ROOT / name).parent
-        for rel in re.findall(r"\]\((?!https?:|#)([^)#]+)\)", text):
-            if not (base / rel).exists():
-                problems.append(f"{name} のリンク {rel} のファイルがありません")
+    check_links(problems)
 
     # 6. md の体裁（強調のスペース・罫線行の前の空行）
     check_markdown_style(problems)
