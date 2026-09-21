@@ -54,13 +54,13 @@ Backlog の課題を、 **子課題ごとまとめて複製する** CLI ツー�
 
 ```cmd
 :: Windows: menu.bat をダブルクリック、またはコマンドから
-cd C:/tools/backlog_issue_cloner
+cd C:/path/to/backlog_issue_cloner
 menu.bat
 ```
 
 ```bash
 # macOS / Linux
-cd ~/ws/backlog_issue_cloner
+cd /path/to/backlog_issue_cloner
 python3 menu.py
 ```
 
@@ -344,7 +344,7 @@ clone:
 :: Windows タスクスケジューラ（操作 → プログラムの開始）
 :: プログラム: C:/Python312/python.exe
 :: 引数      : backlog_issue_cloner.py --execute --yes
-:: 開始      : C:/tools/backlog_issue_cloner
+:: 開始      : C:/path/to/backlog_issue_cloner
 ```
 
 `--config` は相対パスだと実行時のカレントディレクトリに依存するため、
