@@ -2844,5 +2844,146 @@ class TestMain(unittest.TestCase):
         self.assertEqual(args.date, "20260401")
 
 
+# ===========================================================================
+# show_source_issue テスト
+# ===========================================================================
+
+
+def _show_source(issue, *, source_issue_key="PROJ-1"):
+    """--show-source を実行し、標準出力を返す。"""
+    client = MagicMock()
+    client.get_issue.return_value = issue
+    out = StringIO()
+    with patch("backlog_issue_cloner.BacklogClient", return_value=client), \
+         patch("sys.stdout", new=out):
+        sut.show_source_issue(
+            _make_args(), _make_config(source_issue_key=source_issue_key)
+        )
+    return out.getvalue()
+
+
+class TestShowSourceIssue(unittest.TestCase):
+    """--show-source の表示を検証。
+
+    カスタム属性の必須エラーを追うための唯一の手掛かりになる機能のため、
+    表示が実態とずれると調査が誤った方向へ進む。
+    """
+
+    def test_issue_not_found(self):
+        """課題が見つからなければ ConfigError で止まる。"""
+        client = MagicMock()
+        client.get_issue.return_value = None
+        with patch("backlog_issue_cloner.BacklogClient", return_value=client), \
+             patch("sys.stdout", new_callable=StringIO):
+            with self.assertRaises(sut.ConfigError) as cm:
+                sut.show_source_issue(_make_args(), _make_config())
+        self.assertIn("PROJ-1", str(cm.exception))
+
+    def test_shows_issue_type(self):
+        """種別を表示する。作成時にこの種別が使われることも併記する。"""
+        out = _show_source({
+            "issueKey": "PROJ-1", "summary": "テンプレート課題",
+            "issueType": {"id": 1, "name": "タスク"}, "customFields": [],
+        })
+        self.assertIn("PROJ-1 ― テンプレート課題", out)
+        self.assertIn("種別: タスク", out)
+        self.assertIn("この種別で作成します", out)
+
+    def test_issue_type_missing(self):
+        """種別が応答に無くても落ちない。"""
+        out = _show_source({"issueKey": "PROJ-1", "customFields": []})
+        self.assertIn("種別: （不明）", out)
+
+    def test_custom_fields_absent_and_empty_are_distinguished(self):
+        """「応答に含まれない」と「属性が無い」は別の表示にする。
+
+        一覧の応答にカスタム属性が含まれないことがあり、
+        取り違えると「属性が無い」と誤認して調査が止まる。
+        """
+        absent = _show_source({"issueKey": "PROJ-1"})
+        self.assertIn("レスポンスに含まれていません", absent)
+
+        empty = _show_source({"issueKey": "PROJ-1", "customFields": []})
+        self.assertIn("カスタム属性: ありません", empty)
+
+    def test_lists_fields_with_type_name_and_value(self):
+        """ID・種別名・属性名・値を並べる。"""
+        out = _show_source({
+            "issueKey": "PROJ-1",
+            "customFields": [
+                {"id": 11, "fieldTypeId": 7, "name": "作業完了チェック", "value": []},
+                {"id": 12, "fieldTypeId": 1, "name": "備考", "value": "メモ"},
+            ],
+        })
+        self.assertIn("id=11  チェックボックス  '作業完了チェック'  値: （未設定）", out)
+        self.assertIn("id=12  文字列  '備考'  値: 'メモ'", out)
+
+    def test_unknown_field_type_is_labeled(self):
+        """未知の種別 ID は「不明」と示す。黙って空欄にしない。"""
+        out = _show_source({
+            "issueKey": "PROJ-1",
+            "customFields": [{"id": 13, "fieldTypeId": 99, "name": "新種別",
+                             "value": "x"}],
+        })
+        # 種別が無いときの「（不明）」と紛れないよう、属性の行そのものを見る
+        self.assertIn("id=13  不明  '新種別'", out)
+
+    def test_empty_values_are_warned_with_ids(self):
+        """未設定の属性は ID を並べて警告する。必須ならここが失敗の原因になる。"""
+        out = _show_source({
+            "issueKey": "PROJ-1",
+            "customFields": [
+                {"id": 11, "fieldTypeId": 7, "name": "チェック", "value": []},
+                {"id": 12, "fieldTypeId": 1, "name": "備考", "value": None},
+                {"id": 13, "fieldTypeId": 1, "name": "入力済", "value": "値"},
+            ],
+        })
+        self.assertIn("値が未設定の属性があります（id=11、12）", out)
+        self.assertNotIn("13", out.split("値が未設定")[1])
+        self.assertIn("clone.custom_fields", out)
+
+    def test_no_warning_when_all_filled(self):
+        """すべて値があれば警告は出さない。"""
+        out = _show_source({
+            "issueKey": "PROJ-1",
+            "customFields": [{"id": 12, "fieldTypeId": 1, "name": "備考",
+                             "value": "値"}],
+        })
+        self.assertNotIn("値が未設定の属性があります", out)
+
+    def test_shows_params_actually_sent(self):
+        """作成時に実際に渡すパラメータを表示する。
+
+        表示した値と送る値がずれると、この機能は調査の役に立たない。
+        """
+        issue = {
+            "issueKey": "PROJ-1",
+            "customFields": [{"id": 12, "fieldTypeId": 1, "name": "備考",
+                             "value": "メモ"}],
+        }
+        out = _show_source(issue)
+        self.assertIn("作成時に渡す値: ", out)
+        self.assertIn(str(sut.custom_field_params(issue)), out)
+
+    def test_shows_none_when_nothing_is_sent(self):
+        """渡す値が無ければ「なし」と示す。空の辞書を見せない。"""
+        out = _show_source({
+            "issueKey": "PROJ-1",
+            "customFields": [{"id": 11, "fieldTypeId": 7, "name": "チェック",
+                             "value": []}],
+        })
+        self.assertIn("作成時に渡す値: なし", out)
+
+    def test_does_not_write_to_backlog(self):
+        """表示だけで、作成も更新も行わない。"""
+        client = MagicMock()
+        client.get_issue.return_value = {"issueKey": "PROJ-1", "customFields": []}
+        with patch("backlog_issue_cloner.BacklogClient", return_value=client), \
+             patch("sys.stdout", new_callable=StringIO):
+            sut.show_source_issue(_make_args(), _make_config())
+        client.create_issue.assert_not_called()
+        client.update_issue.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
