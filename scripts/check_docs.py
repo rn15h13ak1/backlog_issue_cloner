@@ -79,7 +79,10 @@ def anchors(markdown: str) -> set:
     }
 
 
-MARKDOWN_FILES = ("README.md", "CHANGELOG.md",
+# CLAUDE.md も対象にする。check-markdown.sh はリポジトリの外にあるファイル
+# （`../ws-conventions/README.md` など）のアンカーを見ないため、規約側の見出しが
+# 変わっても気付けない。CLAUDE.md はその外向きのリンクを持つ唯一のファイル。
+MARKDOWN_FILES = ("README.md", "CHANGELOG.md", "CLAUDE.md",
                   "docs/DESIGN.md", "docs/EXAMPLES.md")
 
 # 強調記法。インラインコードを跨ぐ場合があるので、コードを退避してから当てる。
