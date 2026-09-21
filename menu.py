@@ -29,6 +29,7 @@ except ModuleNotFoundError as e:
     if e.name != "yaml":
         raise
     print("必要なライブラリ PyYAML が入っていません。")
+    print(f"実行中の Python: {sys.executable}")
     print("次のコマンドでインストールしてください:")
     print("    pip install pyyaml")
     sys.exit(2)

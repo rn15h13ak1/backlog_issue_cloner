@@ -48,7 +48,20 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-import yaml
+try:
+    import yaml
+except ModuleNotFoundError as e:
+    # 依存が入っていない Python で起動したとき、トレースバックではなく
+    # 対処を表示する。Windows では py ランチャ経由で複数の Python が
+    # 入っていることがあり、入れた先と動かしている先が違うと
+    # 「pip install したのに直らない」が起きるため、実行中のパスも出す。
+    if e.name != "yaml":
+        raise                      # 無関係な失敗は握り潰さない
+    print("必要なライブラリ PyYAML が入っていません。", file=sys.stderr)
+    print(f"実行中の Python: {sys.executable}", file=sys.stderr)
+    print("次のコマンドでインストールしてください:", file=sys.stderr)
+    print("    pip install pyyaml", file=sys.stderr)
+    sys.exit(2)                    # EXIT_CONFIG_ERROR（定義はこの下）
 
 
 # ===========================================================================
