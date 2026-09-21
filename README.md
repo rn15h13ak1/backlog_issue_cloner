@@ -650,8 +650,8 @@ python3 scripts/mutation_test.py               # テストが退行を検知で�
 ```
 
 `check_docs.py` は設定項目・CLI オプション・Exit code が実装と README と
-`config.example.yaml` で一致しているか、リンクが切れていないか（他ファイルの
-見出しアンカーを含む）を確認します。
+`config.example.yaml` で一致しているか、md の体裁が揃っているかを確認します。
+リンクとアンカーは共通規約の `check-markdown.sh` が見ます。
 `mutation_test.py` は実装にわざとバグを埋め込み、テストが落ちるかを確認します。
 どちらも問題があれば Exit code `1` を返します。
 

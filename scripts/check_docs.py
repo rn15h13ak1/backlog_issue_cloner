@@ -3,8 +3,11 @@
 ドキュメントと実装の整合を検査する
 ====================================
 設定項目・コマンドラインオプション・終了コードが、実装と README と
-config.example.yaml で一致しているかを確認する。リンク切れと、
+config.example.yaml で一致しているかを確認する。
 md の体裁（強調の両端の半角スペース・罫線行の前の空行）も検査する。
+
+リンクとアンカーは検査しない。../ws-conventions/bin/check-markdown.sh が
+リポジトリの外を指すものも含めて見ており、そちらが正しく動く。
 
     python3 scripts/check_docs.py
 
@@ -71,17 +74,10 @@ def cli_options(src: str) -> set:
             re.findall(r'add_argument\(\s*(?:"(-\w)",\s*)?"(--[\w-]+)"', src)}
 
 
-def anchors(markdown: str) -> set:
-    """GitHub の見出しアンカーを再現する。"""
-    return {
-        re.sub(r"[^0-9a-z぀-ヿ一-鿿 -]", "", h.lower()).replace(" ", "-")
-        for h in re.findall(r"^#{1,6} (.+)$", markdown, re.M)
-    }
-
-
-# CLAUDE.md も対象にする。check-markdown.sh はリポジトリの外にあるファイル
-# （`../ws-conventions/README.md` など）のアンカーを見ないため、規約側の見出しが
-# 変わっても気付けない。CLAUDE.md はその外向きのリンクを持つ唯一のファイル。
+# 体裁を検査する md。CLAUDE.md も含める（外向きのリンクを持つ唯一のファイル）。
+# リンクとアンカーの検査は ../ws-conventions/bin/check-markdown.sh が行う。
+# こちらでも見ていたが、コードフェンスを剥がさずに走査しており、コード例の中に
+# 書いたリンクを実在しないものとして報告していた。二重に持つ理由も無いため外した。
 MARKDOWN_FILES = ("README.md", "CHANGELOG.md", "CLAUDE.md",
                   "docs/DESIGN.md", "docs/EXAMPLES.md")
 
@@ -98,58 +94,6 @@ def body_lines(markdown: str):
             continue
         if not fence:
             yield number, line
-
-
-LINK_RE = re.compile(r"\]\((?!https?:|mailto:)([^)\s]+)\)")
-
-
-def check_links(problems: list) -> None:
-    """
-    md のリンクを検査する。
-
-    同じファイル内のアンカー（`#見出し`）だけでなく、他ファイルのアンカー
-    （`../README.md#見出し`）も見る。飛び先の見出しが無くてもリンクは押せて
-    しまい、ファイルの先頭に着くだけなので気づきにくい。
-    """
-    anchor_cache = {}
-
-    def anchors_of(path: Path) -> set | None:
-        """md ファイルの見出しアンカー。md でない・読めない場合は None。"""
-        if path not in anchor_cache:
-            if path.suffix.lower() != ".md" or not path.is_file():
-                anchor_cache[path] = None
-            else:
-                anchor_cache[path] = anchors(path.read_text(encoding="utf-8"))
-        return anchor_cache[path]
-
-    for name in MARKDOWN_FILES:
-        source = ROOT / name
-        text = read(name)
-        own = anchors(text)
-
-        for link in LINK_RE.findall(text):
-            target, _, fragment = link.partition("#")
-
-            if not target:                      # 同じファイル内のアンカー
-                if fragment not in own:
-                    problems.append(
-                        f"{name} のリンク #{fragment} に対応する見出しがありません"
-                    )
-                continue
-
-            path = (source.parent / target).resolve()
-            if not path.exists():
-                problems.append(f"{name} のリンク {target} のファイルがありません")
-                continue
-
-            if not fragment:
-                continue
-            found = anchors_of(path)
-            if found is not None and fragment not in found:
-                problems.append(
-                    f"{name} のリンク {link} に対応する見出しが"
-                    f" {target} にありません"
-                )
 
 
 def check_markdown_style(problems: list) -> None:
@@ -221,13 +165,10 @@ def check() -> list:
         if not re.search(rf"\| `{code}` \|", readme):
             problems.append(f"終了コード {code}（{name}）が README の表にありません")
 
-    # 5. リンクとアンカー
-    check_links(problems)
-
-    # 6. md の体裁（強調のスペース・罫線行の前の空行）
+    # 5. md の体裁（強調のスペース・罫線行の前の空行）
     check_markdown_style(problems)
 
-    # 7. 仕様書が挙げる関数が実在するか
+    # 6. 仕様書が挙げる関数が実在するか
     for func in sorted(set(re.findall(r"`(\w+)\(\)`", design))):
         if func not in src and func not in menu_src:
             problems.append(f"docs/DESIGN.md が挙げる {func}() が実装にありません")
