@@ -45,6 +45,7 @@ Backlog の課題を、 **子課題ごとまとめて複製する** CLI ツー�
 18. [設計方針](#設計方針)
 19. [テスト](#テスト)
 20. [変更履歴](#変更履歴)
+21. [ライセンス](#ライセンス)
 
 ---
 
@@ -570,6 +571,7 @@ backlog_issue_cloner/
 ├── menu.bat                  メニューの起動用（Windows でダブルクリック）
 ├── config.example.yaml       設定ファイルのテンプレート
 ├── CHANGELOG.md              変更履歴
+├── LICENSE                   MIT ライセンス
 ├── config.yaml               実際の設定。API キーを含むため Git 管理外
 ├── .gitattributes            menu.bat の改行コードを CRLF に固定
 ├── docs/
@@ -661,3 +663,9 @@ python3 scripts/mutation_test.py               # テストが退行を検知で�
 
 [CHANGELOG.md](CHANGELOG.md) を参照。バージョンはコミット履歴からさかのぼって
 付けたもので、タグは打っていません。
+
+---
+
+## ライセンス
+
+MIT License。全文は [LICENSE](LICENSE) にあります。
