@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+### Added
+- `.gitignore` に SSH の鍵 5 行（`id_rsa*` ・ `id_ed25519*` ・ `id_ecdsa*` ・ `*.ppk` ・
+  `known_hosts`）を追加した。共通規約の定型が 7 行から 12 行に広がったため。
+  **`*.pem` ・ `*.key` では代替できない。** OpenSSH が既定で作る鍵は拡張子を持たない。
+  指摘は `../proposals/gitignore-credential-lines.md`
+
 ## [0.8.2] - 2026-09-21
 
 ドキュメント検査の誤検知を、検査ごと共通規約側に寄せて解消しました。

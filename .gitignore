@@ -22,6 +22,12 @@ credentials*
 *.pem
 *.key
 *.local.yaml
+# SSH の鍵（*.pem / *.key は拡張子にしか当たらないため、別に要る）
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.ppk
+known_hosts
 
 # 本ツールの設定の実体（Backlog の API キーを書くため）
 config.yaml
