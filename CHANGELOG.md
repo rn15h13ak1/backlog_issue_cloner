@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+### Changed
+- `CLAUDE.md` の「共通規約からの逸脱」を「commit / push と検査」に改め、自動の commit / push を
+  規約 A への参照に置き換えた。2026-10-02 の規約 A の改定で、逸脱ではなくなったため。
+  自動コミットの手順と検査は残した。指摘は `../proposals/stale-commit-push-deviation.md`
+
 ## [0.8.3] - 2026-09-21
 
 共通規約の `.gitignore` の定型が広がったぶんを取り込みました。
